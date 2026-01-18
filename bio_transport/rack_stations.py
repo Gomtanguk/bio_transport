@@ -1,7 +1,7 @@
-# rack_stations v1.000
+# rack_stations v1.010
 # [이번 버전에서 수정된 사항]
-# - v1.000 기준선(Baseline) 설정
-# - 랙 A~F 타겟 좌표 단일 관리 + station(approach/target/retract) 생성
+# - v1.010 설정
+# - 랙 A~F 타겟 좌표 단일 관리 -> 랙 A-1~3, B-1~3 타겟 좌표로 변경
 
 DEFAULT_APPROACH_DY = -100.0
 
