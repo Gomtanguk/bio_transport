@@ -29,6 +29,8 @@ setup(
         'rack_pick = bio_transport.rack_pick_node:main',
         'bio_test = bio_transport.test_node:main',
         'rack_transport_ui = bio_transport.rack_transport_ui:main',
+        'rack_inbound = bio_transport.rack_inbound_node:main',
+        'rack_outbound = bio_transport.rack_outbound_node:main',
         ],
     },
 )

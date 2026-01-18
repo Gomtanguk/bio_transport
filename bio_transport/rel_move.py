@@ -6,7 +6,7 @@
 REL_ACC = 20
 
 
-def rel_movel_xyzabc(dr, x, y, z, a, b, c, vel):
+def rel_movel_tool(dr, x, y, z, a, b, c, vel):
     required = ["movel", "posx", "DR_TOOL", "DR_MV_MOD_REL"]
     for fn in required:
         if not hasattr(dr, fn):
@@ -17,5 +17,19 @@ def rel_movel_xyzabc(dr, x, y, z, a, b, c, vel):
         vel=float(vel),
         acc=REL_ACC,
         ref=dr.DR_TOOL,
+        mod=dr.DR_MV_MOD_REL
+    )
+
+def rel_movel_base(dr, x, y, z, a, b, c, vel):
+    required = ["movel", "posx", "DR_BASE", "DR_MV_MOD_REL"]
+    for fn in required:
+        if not hasattr(dr, fn):
+            raise AttributeError("DSR_ROBOT2 missing API: %s" % fn)
+
+    dr.movel(
+        dr.posx(float(x), float(y), float(z), float(a), float(b), float(c)),
+        vel=float(vel),
+        acc=REL_ACC,
+        ref=dr.DR_BASE,
         mod=dr.DR_MV_MOD_REL
     )

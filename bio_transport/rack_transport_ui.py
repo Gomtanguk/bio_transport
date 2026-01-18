@@ -295,41 +295,66 @@ class BioBankApp(QMainWindow):
 
     def on_confirm_t2(self):
         mode = self.t2_mode_group.checkedId()
-        sel = self.le_t2_selected.text()
-        dest = self.le_t2_dest.text()
+        sel = self.le_t2_selected.text().strip()
+        dest = self.le_t2_dest.text().strip()
 
-        if mode == 1 and not dest:
-            self.log_t2("[경고] 입고 위치 선택 필요")
+        # -------------------------
+        # mode 1: inbound (WORKBENCH -> to_rack)
+        # -------------------------
+        if mode == 1:
+            if not dest:
+                self.log_t2("[경고] 입고 위치(to_rack) 1개를 선택하세요.")
+                return
+
+            self.log_t2(f"[실행] rack_inbound (WORKBENCH -> {dest})")
+            extra = f"--ros-args -p to_rack:='{dest}'"
+            self.run_ros2("rack_inbound", extra_ros_args=extra)
+
+            self.log_t2(f"✅ [렉 입고 요청] 위치: {dest}")
+            self.reset_selection_t2()
             return
-        if mode == 2 and not sel:
-            self.log_t2("[경고] 출고 대상 선택 필요")
+
+        # -------------------------
+        # mode 2: outbound (from_rack -> WORKBENCH)
+        # -------------------------
+        if mode == 2:
+            if not sel:
+                self.log_t2("[경고] 출고 대상(from_rack) 1개를 선택하세요.")
+                return
+
+            self.log_t2(f"[실행] rack_outbound ({sel} -> WORKBENCH)")
+            extra = f"--ros-args -p from_rack:='{sel}'"
+            self.run_ros2("rack_outbound", extra_ros_args=extra)
+
+            self.log_t2(f"✅ [렉 출고 요청] 대상: {sel}")
+            self.reset_selection_t2()
             return
+
+        # -------------------------
+        # mode 3: transport (from -> to)
+        # -------------------------
         if mode == 3:
+            if not sel or not dest:
+                self.log_t2("[경고] 이동 대상(sel)과 목적지(dest)를 선택하세요.")
+                return
             if sel == dest:
                 self.log_t2("[경고] from/to가 같습니다. 다른 랙을 선택하세요.")
                 return
 
-            self.log_t2("[실행] rack_transport 노드 실행 (params)")
+            self.log_t2(f"[실행] rack_transport ({sel} -> {dest})")
             extra = f"--ros-args -p from_rack:='{sel}' -p to_rack:='{dest}'"
             self.run_ros2("rack_transport", extra_ros_args=extra)
 
-        action = {1: "렉 입고", 2: "렉 출고", 3: "렉 이동"}[mode]
-        msg = f"✅ [{action} 완료] "
-        if mode == 1:
-            msg += f"위치: {dest}"
-        elif mode == 2:
-            msg += f"대상: {sel}"
-        elif mode == 3:
-            msg += f"{sel} ➡️ {dest}"
+            self.log_t2(f"✅ [렉 이동 요청] {sel} ➡️ {dest}")
+            self.reset_selection_t2()
+            return
 
-        # ✅ 렉 이동 모드에서만 로봇 동작 실행 + 파라미터 전달
-        if mode == 3:
-            self.log_t2("[실행] rack_transport 노드 실행 (params)")
-            extra = f"--ros-args -p from_rack:='{sel}' -p to_rack:='{dest}'"
-            self.run_ros2("rack_transport", extra_ros_args=extra)
+        # -------------------------
+        # fallback
+        # -------------------------
+        self.log_t2("[경고] 알 수 없는 모드입니다.")
 
-        self.log_t2(msg)
-        self.reset_selection_t2()
+        
 
     def log_t1(self, msg):
         self.txt_log_t1.append(msg)
@@ -341,6 +366,10 @@ class BioBankApp(QMainWindow):
     # ROS2 노드 실행 (UI -> 로봇 동작)
     # ==========================================================
     def run_ros2(self, executable: str, extra_ros_args: str = ""):
+                # 이전 실행이 끝났으면 proc 참조 정리
+        if self.proc is not None and self.proc.poll() is not None:
+            self.proc = None
+
         # ✅ 중복 실행 방지
         if self.proc is not None and self.proc.poll() is None:
             self.log_t2("[WARN] rack_transport already running. (blocked)")

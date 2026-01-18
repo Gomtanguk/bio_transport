@@ -1,8 +1,9 @@
-# rack_transport_node v1.111 2026-01-18
+# rack_transport_node v1.200 2026-01-18
 # [이번 버전에서 수정된 사항]
-# - (버그수정) A안(1회 실행) 모드에서 rclpy.spin(node)로 인해 대기 상태로 멈추는 문제 수정
-# - (버그수정) rclpy.shutdown() 중복 호출로 인한 예외 가능성 완화
-# - (유지) v1.110 파라미터 안정화(from_rack/to_rack normalize/validate/fallback) 및 Pick/Place 구조 유지
+# - (기능변경) rack_pick_only(v1.500) 시그니처에 맞춰 rack_transport 전체 호출부/변수 정리
+# - (버그수정) 잘못된 전역 상수 참조(GRIP_WAIT_SEC/PICK_LIFT_MM 등) -> 파라미터 기반 변수로 통일
+# - (유지) A안(1회 실행) 구조 유지 (spin 없음)
+# - (유지) from/to 파라미터 normalize/validate/fallback 유지
 
 import re
 import rclpy
@@ -10,7 +11,7 @@ import DR_init
 
 from .gripper_io import grip_open, grip_close, grip_init_open
 from .probe_io import probe_contact_for_rack
-from .rel_move import rel_movel_xyzabc as rel_move
+from .rel_move import rel_movel_tool, rel_movel_base
 from .rack_stations import build_rack_stations, RACK_TARGETS
 from .rack_pick_io import rack_pick_only
 from .rack_place_io import rack_place_only
@@ -41,8 +42,15 @@ DEFAULT_MOVE_ACC = 200.0
 DEFAULT_APPROACH_DY = -100.0
 
 DEFAULT_GRIP_WAIT_SEC = 1.0
-DEFAULT_PICK_LIFT_MM = 20.0
-DEFAULT_PICK_LIFT_VEL = 20.0
+
+# rack_pick_only(v1.500) 관련 기본값
+DEFAULT_PRE_LIFT_TOOL_MM = 20.0
+DEFAULT_PRE_LIFT_TOOL_VEL = 20.0
+DEFAULT_POST_LIFT_BASE_MM = 20.0
+DEFAULT_POST_LIFT_BASE_VEL = 20.0
+DEFAULT_RETRACT_REL_Y_MM = 100.0
+DEFAULT_RETRACT_REL_VEL = 50.0
+
 DEFAULT_PLACE_PRE_OPEN = True
 
 V_J = VELOCITY
@@ -68,35 +76,23 @@ def initialize_robot(node):
 
 
 def _valid_rack_keys():
-    """rack_stations.RACK_TARGETS 기반으로 유효 rack key 생성"""
     keys = list(RACK_TARGETS.keys())
     keys.sort()
     return keys
 
 
 def _normalize_rack_name(raw):
-    """
-    사용자 입력을 최대한 관대하게 보정해서 표준 키(A-1 형태)로 변환
-
-    허용 입력 예:
-      - "a-1", " A - 1 ", "A_1", "a 1"  -> "A-1"
-      - "b3", "B 3"                     -> "B-3"
-    """
     if raw is None:
         return ""
 
     s = str(raw).strip().upper()
-
-    # 구분자 통일 및 공백 제거
     s = s.replace("_", "-")
     s = re.sub(r"\s+", "", s)
 
-    # "A-1"
     m = re.match(r"^([A-Z])\-([0-9]+)$", s)
     if m:
         return "%s-%s" % (m.group(1), m.group(2))
 
-    # "A1"
     m = re.match(r"^([A-Z])([0-9]+)$", s)
     if m:
         return "%s-%s" % (m.group(1), m.group(2))
@@ -105,14 +101,6 @@ def _normalize_rack_name(raw):
 
 
 def _resolve_rack_param(node, name, default_key, valid_keys):
-    """
-    파라미터(name)의 입력값을 읽고:
-      - normalize
-      - valid 검사
-      - invalid면 default로 폴백
-
-    Returns: (resolved_key, meta_dict)
-    """
     raw = node.get_parameter(name).value
     norm = _normalize_rack_name(raw)
 
@@ -128,18 +116,25 @@ def _resolve_rack_param(node, name, default_key, valid_keys):
     return default_key, {"raw": str(raw), "normalized": norm, "used_default": True, "fallback": default_key}
 
 
-def rack_to_rack(node, dr, rack_stations, fr, tr,
-                move_vel, move_acc,
-                grip_wait_sec,
-                pick_lift_mm, pick_lift_vel,
-                place_pre_open):
-    """
-    Orchestration:
-      Pick(from_rack) -> Place(to_rack)
-
-    Returns:
-      (ok: bool, info: dict)
-    """
+def rack_to_rack(
+    node,
+    dr,
+    rack_stations,
+    fr,
+    tr,
+    move_vel,
+    move_acc,
+    grip_wait_sec,
+    # pick(v1.500)
+    pre_lift_tool_mm,
+    pre_lift_tool_vel,
+    post_lift_base_mm,
+    post_lift_base_vel,
+    retract_rel_y_mm,
+    retract_rel_vel,
+    # place
+    place_pre_open,
+):
     sp_from = rack_stations.get(fr)
     sp_to = rack_stations.get(tr)
 
@@ -154,17 +149,30 @@ def rack_to_rack(node, dr, rack_stations, fr, tr,
         node=node,
         dr=dr,
         station=sp_from,
-        tag="PICK_%s" % fr,
+        tag=f"PICK_{fr}",
         probe_fn=probe_contact_for_rack,
         grip_open_fn=grip_open,
         grip_close_fn=grip_close,
-        rel_move_fn=rel_move,
+
+        # v1.500
+        rel_move_tool_fn=rel_movel_tool,
+        rel_move_base_fn=rel_movel_base,
+
         grip_wait_sec=grip_wait_sec,
-        lift_mm=pick_lift_mm,
-        lift_vel=pick_lift_vel,
+
+        pre_lift_tool_mm=pre_lift_tool_mm,
+        pre_lift_tool_vel=pre_lift_tool_vel,
+
+        post_lift_base_mm=post_lift_base_mm,
+        post_lift_base_vel=post_lift_base_vel,
+
+        retract_rel_y_mm=retract_rel_y_mm,
+        retract_rel_vel=retract_rel_vel,
+
         abort_to_approach=True,
         move_vel=move_vel,
         move_acc=move_acc,
+        align_to_retract_pose=False,
     )
 
     if not ok_pick:
@@ -176,7 +184,7 @@ def rack_to_rack(node, dr, rack_stations, fr, tr,
         node=node,
         dr=dr,
         station=sp_to,
-        tag="PLACE_%s" % tr,
+        tag=f"PLACE_{tr}",
         grip_open_fn=grip_open,
         grip_wait_sec=grip_wait_sec,
         move_vel=move_vel,
@@ -200,8 +208,16 @@ def _declare_params(node):
     node.declare_parameter("move_acc", float(DEFAULT_MOVE_ACC))
 
     node.declare_parameter("grip_wait_sec", float(DEFAULT_GRIP_WAIT_SEC))
-    node.declare_parameter("pick_lift_mm", float(DEFAULT_PICK_LIFT_MM))
-    node.declare_parameter("pick_lift_vel", float(DEFAULT_PICK_LIFT_VEL))
+
+    # pick(v1.500)
+    node.declare_parameter("pre_lift_tool_mm", float(DEFAULT_PRE_LIFT_TOOL_MM))
+    node.declare_parameter("pre_lift_tool_vel", float(DEFAULT_PRE_LIFT_TOOL_VEL))
+    node.declare_parameter("post_lift_base_mm", float(DEFAULT_POST_LIFT_BASE_MM))
+    node.declare_parameter("post_lift_base_vel", float(DEFAULT_POST_LIFT_BASE_VEL))
+    node.declare_parameter("retract_rel_y_mm", float(DEFAULT_RETRACT_REL_Y_MM))
+    node.declare_parameter("retract_rel_vel", float(DEFAULT_RETRACT_REL_VEL))
+
+    # place
     node.declare_parameter("place_pre_open", bool(DEFAULT_PLACE_PRE_OPEN))
 
 
@@ -216,33 +232,38 @@ def perform_task(node):
     _declare_params(node)
 
     valid_keys = _valid_rack_keys()
-
     fr, fr_meta = _resolve_rack_param(node, "from_rack", DEFAULT_FROM_RACK, valid_keys)
     tr, tr_meta = _resolve_rack_param(node, "to_rack", DEFAULT_TO_RACK, valid_keys)
 
-    # 같은 랙이면 즉시 abort
     if fr == tr:
-        node.get_logger().error(
-            "[ABORT] from_rack == to_rack (%s). Change parameters. valid=%s" %
-            (fr, ",".join(valid_keys))
-        )
+        node.get_logger().error("[ABORT] from_rack == to_rack (%s). Change parameters." % fr)
         return
 
     approach_dy = float(node.get_parameter("approach_dy").value)
     move_vel = float(node.get_parameter("move_vel").value)
     move_acc = float(node.get_parameter("move_acc").value)
-
     grip_wait_sec = float(node.get_parameter("grip_wait_sec").value)
-    pick_lift_mm = float(node.get_parameter("pick_lift_mm").value)
-    pick_lift_vel = float(node.get_parameter("pick_lift_vel").value)
+
+    # pick(v1.500)
+    pre_lift_tool_mm = float(node.get_parameter("pre_lift_tool_mm").value)
+    pre_lift_tool_vel = float(node.get_parameter("pre_lift_tool_vel").value)
+    post_lift_base_mm = float(node.get_parameter("post_lift_base_mm").value)
+    post_lift_base_vel = float(node.get_parameter("post_lift_base_vel").value)
+    retract_rel_y_mm = float(node.get_parameter("retract_rel_y_mm").value)
+    retract_rel_vel = float(node.get_parameter("retract_rel_vel").value)
+
     place_pre_open = bool(node.get_parameter("place_pre_open").value)
 
     node.get_logger().info(
-        "[PARAM] from_rack=%s(to raw=%s) to_rack=%s(to raw=%s) approach_dy=%.1f move_vel=%.1f move_acc=%.1f "
-        "grip_wait_sec=%.2f pick_lift_mm=%.1f pick_lift_vel=%.1f place_pre_open=%s" %
-        (fr, fr_meta.get("raw", ""), tr, tr_meta.get("raw", ""),
-         approach_dy, move_vel, move_acc,
-         grip_wait_sec, pick_lift_mm, pick_lift_vel, str(place_pre_open))
+        "[PARAM] from=%s(raw=%s) to=%s(raw=%s) approach_dy=%.1f move_vel=%.1f move_acc=%.1f grip_wait_sec=%.2f "
+        "pick(pre_tool_z=%.1f, post_base_z=%.1f, retract_y=%.1f) place_pre_open=%s" %
+        (
+            fr, fr_meta.get("raw", ""),
+            tr, tr_meta.get("raw", ""),
+            approach_dy, move_vel, move_acc, grip_wait_sec,
+            pre_lift_tool_mm, post_lift_base_mm, retract_rel_y_mm,
+            str(place_pre_open),
+        )
     )
 
     home_j = dr.posj(0, 0, 90, 0, 90, 0)
@@ -260,8 +281,12 @@ def perform_task(node):
         move_vel=move_vel,
         move_acc=move_acc,
         grip_wait_sec=grip_wait_sec,
-        pick_lift_mm=pick_lift_mm,
-        pick_lift_vel=pick_lift_vel,
+        pre_lift_tool_mm=pre_lift_tool_mm,
+        pre_lift_tool_vel=pre_lift_tool_vel,
+        post_lift_base_mm=post_lift_base_mm,
+        post_lift_base_vel=post_lift_base_vel,
+        retract_rel_y_mm=retract_rel_y_mm,
+        retract_rel_vel=retract_rel_vel,
         place_pre_open=place_pre_open,
     )
     node.get_logger().info("[RESULT] ok=%s info=%s" % (str(ok), str(info)))
@@ -270,7 +295,6 @@ def perform_task(node):
 
 
 def main(args=None):
-    # ✅ A안(1회 실행): spin 없이 파라미터 읽고 수행 후 종료
     rclpy.init(args=args)
     node = rclpy.create_node("rack_transport", namespace=ROBOT_ID)
     DR_init.__dsr__node = node
@@ -279,7 +303,6 @@ def main(args=None):
         from DSR_ROBOT2 import wait
         initialize_robot(node)
         wait(1.0)
-
         perform_task(node)
 
     except KeyboardInterrupt:

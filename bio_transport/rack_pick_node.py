@@ -8,7 +8,7 @@ import DR_init
 
 from .gripper_io import grip_open, grip_close, grip_init_open
 from .probe_io import probe_contact_for_rack
-from .rel_move import rel_movel_xyzabc as rel_move
+from .rel_move import rel_movel_tool as rel_move
 from .rack_stations import build_rack_stations
 from .rack_pick_io import rack_pick_only
 
