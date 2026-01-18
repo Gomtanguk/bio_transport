@@ -1,10 +1,18 @@
-# rack_pick_io v1.500 2026-01-18
+# rack_pick_io v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능변경) probe 이후 lift를 2단계로 혼합 적용
-#   A) 집기 전:  TOOL +Z pre_lift_tool_mm -> grip_close
-#   B) 집은 후:  BASE +Z post_lift_base_mm
-# - (유지) 집은 뒤 리트랙트는 BASE 상대이동(Y -retract_rel_y_mm)
-# - (구조개선) TOOL lift / BASE lift / BASE retract를 파라미터로 분리
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] rack_pick_io
+
+[역할]
+- 랙에서 랙/워크벤치로 이동하기 위한 Pick 동작 IO 시퀀스 제공
+
+[일반 흐름]
+1) approach로 안전 접근
+2) target 접근
+3) 그리퍼/프로브/리트랙트 등 Pick 시퀀스
+"""
 
 DEFAULT_GRIP_WAIT_SEC = 1.0
 

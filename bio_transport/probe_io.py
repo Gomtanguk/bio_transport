@@ -1,3 +1,25 @@
+# probe_io v2.000 2026-01-19
+# [이번 버전에서 수정된 사항]
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] probe_io
+
+[역할]
+- 순응제어/힘제어 기반 접촉(Probe) 루틴 제공
+
+[핵심 흐름]
+1) TOOL 좌표계 설정
+2) compliance ON
+3) desired force 설정
+4) step 이동하며 힘 모니터
+5) 접촉 판정 후 retract
+6) compliance OFF
+
+[함수]
+- probe_contact_for_rack(): 랙/워크벤치 접촉 프로빙
+"""
+
 # probe_io v1.000
 # [이번 버전에서 수정된 사항]
 # - v1.000 기준선(Baseline) 설정

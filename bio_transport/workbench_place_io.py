@@ -1,9 +1,12 @@
-# workbench_place_io v1.000 2026-01-18
+# workbench_place_io v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능추가) WORKBENCH 전용 Place 함수 제공
-#   - 시퀀스: movel(approach) -> movel(target) -> grip_open
-#   - retract(movel)은 수행하지 않음 (후처리 rel_move로 대체)
+# - v2.000 기준 헤더 포맷 통일
+# - WORKBENCH place 시퀀스 설명 주석 강화(기능 변경 없음)
 
+# [모듈 역할]
+# - WORKBENCH 전용 Place 시퀀스 함수 제공
+# - 시퀀스: (옵션)pre_open -> movel(approach) -> movel(target) -> grip_open
+# - retract(movel)은 수행하지 않음(후처리는 rel_move 사용)
 DEFAULT_GRIP_WAIT_SEC = 1.0
 
 

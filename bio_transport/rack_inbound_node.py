@@ -1,14 +1,22 @@
-# rack_inbound_node v1.700 2026-01-18
+# rack_inbound_node v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능추가) 인바운드 구현: WORKBENCH -> to_rack (요구 시퀀스 그대로)
-#   1) WB approach(Y-50) -> WB target
-#   2) probe (TOOL -Z 3mm retract 포함)
-#   3) TOOL +Z 20
-#   4) grip_close
-#   5) retract: BASE +Z 50
-#   6) to_rack approach -> (target BASE Z +20) -> target
-#   7) grip_open
-# - (유지) A안 1회 실행: 수행 후 종료 (spin 없음)
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] rack_inbound_node
+
+[역할]
+- WORKBENCH -> to_rack (랙 입고) 시퀀스를 단발 실행
+
+[시퀀스]
+1) WB approach -> target
+2) probe
+3) TOOL +Z lift
+4) grip_close
+5) BASE +Z retract
+6) to_rack approach -> topZ -> target
+7) grip_open
+"""
 
 import re
 import rclpy

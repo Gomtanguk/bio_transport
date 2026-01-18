@@ -1,9 +1,20 @@
-# rack_transport_node v1.200 2026-01-18
+# rack_transport_node v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능변경) rack_pick_only(v1.500) 시그니처에 맞춰 rack_transport 전체 호출부/변수 정리
-# - (버그수정) 잘못된 전역 상수 참조(GRIP_WAIT_SEC/PICK_LIFT_MM 등) -> 파라미터 기반 변수로 통일
-# - (유지) A안(1회 실행) 구조 유지 (spin 없음)
-# - (유지) from/to 파라미터 normalize/validate/fallback 유지
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] rack_transport_node
+
+[역할]
+- from_rack -> to_rack (랙간 이송) 시퀀스를 단발 실행
+
+[시퀀스(개요)]
+1) from_rack approach -> topZ -> target
+2) grip_close
+3) retract
+4) to_rack approach -> topZ -> target
+5) grip_open
+"""
 
 import re
 import rclpy

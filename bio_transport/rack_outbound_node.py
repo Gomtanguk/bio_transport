@@ -1,10 +1,20 @@
-# rack_outbound_node v1.600 2026-01-18
+# rack_outbound_node v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능변경) WORKBENCH Place를 전용 함수(workbench_place_only)로 분리
-#   - WORKBENCH 접근은 Z+ approach(위에서 내려오기)
-#   - retract movel 제거, 후처리 rel_movel_base(-Y50, +Z50)로 대체
-# - (유지) Pick은 rack_pick_only(v1.500) 호출부(TOOL/BASE 혼합 lift + BASE -Y100 retract) 유지
-# - (유지) A안(1회 실행): 수행 후 종료 (spin 없음)
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] rack_outbound_node
+
+[역할]
+- from_rack -> WORKBENCH (랙 출고) 시퀀스를 단발 실행
+
+[시퀀스(개요)]
+1) from_rack approach -> topZ -> target
+2) grip_close
+3) retract
+4) WB approach -> target
+5) grip_open
+"""
 
 import re
 import rclpy

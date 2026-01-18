@@ -1,3 +1,19 @@
+# gripper_io v2.000 2026-01-19
+# [이번 버전에서 수정된 사항]
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] gripper_io
+
+[역할]
+- DO 기반 그리퍼 OPEN/CLOSE/초기 OPEN 제공
+
+[함수]
+- grip_open(): 그리퍼 열기
+- grip_close(): 그리퍼 닫기
+- grip_init_open(): 노드 시작 시 안전 상태(OPEN)
+"""
+
 # gripper_io v1.000
 # [이번 버전에서 수정된 사항]
 # - v1.000 기준선(Baseline) 설정

@@ -1,10 +1,18 @@
-# rack_stations v1.110 2026-01-18
+# rack_stations v2.000 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - (기능추가) WORKBENCH station 생성 함수 2종 제공
-#   - build_workbench_station_top(): Z+ approach (출고용)
-#   - build_workbench_station_dy():  BASE Y -50 approach (인바운드용)
-# - (유지) 랙 station 생성(build_rack_stations) 방식 유지
-# - (유지) WORKBENCH_TARGET 절대좌표 유지
+# - v2.000 기준 헤더 포맷 통일
+# - 기능별 주석(모듈 역할/시퀀스) 추가
+
+"""[모듈] rack_stations
+
+[역할]
+- 랙/워크벤치 스테이션(approach/target) 좌표 정의 및 생성
+- UI/노드에서 동일 키(A-1 등)로 참조하도록 중앙화
+
+[포인트]
+- build_* 함수가 실제 posx/posj 생성 책임
+- RACK_TARGETS는 유효 키 검증에도 사용
+"""
 
 DEFAULT_APPROACH_DY = -100.0
 
