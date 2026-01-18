@@ -24,9 +24,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'rack_transport = bio_transport.rack_transport_node:main',
+        'rack_transport = bio_transport.rack_transport_node:main',          # 파라미터 실행형
+        'rack_transport_server = bio_transport.rack_transport_server:main', # UI/토픽 대기형(신규 파일)
         'rack_pick = bio_transport.rack_pick_node:main',
         'bio_test = bio_transport.test_node:main',
+        'rack_transport_ui = bio_transport.rack_transport_ui:main',
         ],
     },
 )
