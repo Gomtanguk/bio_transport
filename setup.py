@@ -31,6 +31,7 @@ setup(
         'rack_transport_ui = bio_transport.rack_transport_ui:main',
         'rack_inbound = bio_transport.rack_inbound_node:main',
         'rack_outbound = bio_transport.rack_outbound_node:main',
+        'tube_transport_node = bio_transport.tube_transport_node:main',
         ],
     },
 )
