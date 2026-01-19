@@ -1,19 +1,14 @@
-# rack_transport_node v2.000 2026-01-19
+# rack_transport_node v2.200 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - v2.000 기준 헤더 포맷 통일
-# - 기능별 주석(모듈 역할/시퀀스) 추가
+# - PLACE에 target_top(BASE Z +place_top_dz_mm) -> target 단계 추가
+# - place_pre_open 기본값 False로 변경(조기 오픈 방지)
+# - 파라미터 place_top_dz_mm 추가(기본 20mm)
+# - 버그 수정: node.ge30t_parameter 오타 수정, main()의 dr 미정의 grip_close 호출 제거
 
 """[모듈] rack_transport_node
 
 [역할]
 - from_rack -> to_rack (랙간 이송) 시퀀스를 단발 실행
-
-[시퀀스(개요)]
-1) from_rack approach -> topZ -> target
-2) grip_close
-3) retract
-4) to_rack approach -> topZ -> target
-5) grip_open
 """
 
 import re
@@ -38,7 +33,6 @@ ROBOT_TCP = "GripperDA"
 VELOCITY = 60
 ACC = 60
 
-# DR_init 설정 (DSR_ROBOT2 import 전에 세팅)
 DR_init.__dsr__id = ROBOT_ID
 DR_init.__dsr__model = ROBOT_MODEL
 
@@ -50,28 +44,28 @@ DEFAULT_TO_RACK = "B-1"
 
 DEFAULT_MOVE_VEL = 200.0
 DEFAULT_MOVE_ACC = 200.0
-DEFAULT_APPROACH_DY = -100.0
+DEFAULT_APPROACH_DY = -250.0
 
 DEFAULT_GRIP_WAIT_SEC = 1.0
 
-# rack_pick_only(v1.500) 관련 기본값
+# pick 관련 기본값
 DEFAULT_PRE_LIFT_TOOL_MM = 20.0
 DEFAULT_PRE_LIFT_TOOL_VEL = 20.0
-DEFAULT_POST_LIFT_BASE_MM = 20.0
+DEFAULT_POST_LIFT_BASE_MM = 50.0
 DEFAULT_POST_LIFT_BASE_VEL = 20.0
-DEFAULT_RETRACT_REL_Y_MM = 100.0
+DEFAULT_RETRACT_REL_Y_MM = 250.0
 DEFAULT_RETRACT_REL_VEL = 50.0
 
-DEFAULT_PLACE_PRE_OPEN = True
+# place 관련 기본값
+DEFAULT_PLACE_PRE_OPEN = False
+DEFAULT_PLACE_TOP_DZ_MM = 50.0
 
 V_J = VELOCITY
 A_J = ACC
 
 
 def initialize_robot(node):
-    """로봇 Tool/TCP 설정"""
     from DSR_ROBOT2 import set_tool, set_tcp
-
     node.get_logger().info("#" * 50)
     node.get_logger().info("Initializing robot with the following settings:")
     node.get_logger().info("ROBOT_ID: %s" % ROBOT_ID)
@@ -81,7 +75,6 @@ def initialize_robot(node):
     node.get_logger().info("VELOCITY: %s" % VELOCITY)
     node.get_logger().info("ACC: %s" % ACC)
     node.get_logger().info("#" * 50)
-
     set_tool(ROBOT_TOOL)
     set_tcp(ROBOT_TCP)
 
@@ -95,7 +88,6 @@ def _valid_rack_keys():
 def _normalize_rack_name(raw):
     if raw is None:
         return ""
-
     s = str(raw).strip().upper()
     s = s.replace("_", "-")
     s = re.sub(r"\s+", "", s)
@@ -136,7 +128,7 @@ def rack_to_rack(
     move_vel,
     move_acc,
     grip_wait_sec,
-    # pick(v1.500)
+    # pick
     pre_lift_tool_mm,
     pre_lift_tool_vel,
     post_lift_base_mm,
@@ -145,6 +137,7 @@ def rack_to_rack(
     retract_rel_vel,
     # place
     place_pre_open,
+    place_top_dz_mm,
 ):
     sp_from = rack_stations.get(fr)
     sp_to = rack_stations.get(tr)
@@ -164,22 +157,15 @@ def rack_to_rack(
         probe_fn=probe_contact_for_rack,
         grip_open_fn=grip_open,
         grip_close_fn=grip_close,
-
-        # v1.500
         rel_move_tool_fn=rel_movel_tool,
         rel_move_base_fn=rel_movel_base,
-
         grip_wait_sec=grip_wait_sec,
-
         pre_lift_tool_mm=pre_lift_tool_mm,
         pre_lift_tool_vel=pre_lift_tool_vel,
-
         post_lift_base_mm=post_lift_base_mm,
         post_lift_base_vel=post_lift_base_vel,
-
         retract_rel_y_mm=retract_rel_y_mm,
         retract_rel_vel=retract_rel_vel,
-
         abort_to_approach=True,
         move_vel=move_vel,
         move_acc=move_acc,
@@ -201,6 +187,7 @@ def rack_to_rack(
         move_vel=move_vel,
         move_acc=move_acc,
         pre_open=place_pre_open,
+        top_dz_mm=place_top_dz_mm,
     )
 
     if not ok_place:
@@ -217,10 +204,9 @@ def _declare_params(node):
     node.declare_parameter("approach_dy", float(DEFAULT_APPROACH_DY))
     node.declare_parameter("move_vel", float(DEFAULT_MOVE_VEL))
     node.declare_parameter("move_acc", float(DEFAULT_MOVE_ACC))
-
     node.declare_parameter("grip_wait_sec", float(DEFAULT_GRIP_WAIT_SEC))
 
-    # pick(v1.500)
+    # pick
     node.declare_parameter("pre_lift_tool_mm", float(DEFAULT_PRE_LIFT_TOOL_MM))
     node.declare_parameter("pre_lift_tool_vel", float(DEFAULT_PRE_LIFT_TOOL_VEL))
     node.declare_parameter("post_lift_base_mm", float(DEFAULT_POST_LIFT_BASE_MM))
@@ -230,6 +216,7 @@ def _declare_params(node):
 
     # place
     node.declare_parameter("place_pre_open", bool(DEFAULT_PLACE_PRE_OPEN))
+    node.declare_parameter("place_top_dz_mm", float(DEFAULT_PLACE_TOP_DZ_MM))
 
 
 def perform_task(node):
@@ -255,7 +242,6 @@ def perform_task(node):
     move_acc = float(node.get_parameter("move_acc").value)
     grip_wait_sec = float(node.get_parameter("grip_wait_sec").value)
 
-    # pick(v1.500)
     pre_lift_tool_mm = float(node.get_parameter("pre_lift_tool_mm").value)
     pre_lift_tool_vel = float(node.get_parameter("pre_lift_tool_vel").value)
     post_lift_base_mm = float(node.get_parameter("post_lift_base_mm").value)
@@ -264,16 +250,17 @@ def perform_task(node):
     retract_rel_vel = float(node.get_parameter("retract_rel_vel").value)
 
     place_pre_open = bool(node.get_parameter("place_pre_open").value)
+    place_top_dz_mm = float(node.get_parameter("place_top_dz_mm").value)
 
     node.get_logger().info(
         "[PARAM] from=%s(raw=%s) to=%s(raw=%s) approach_dy=%.1f move_vel=%.1f move_acc=%.1f grip_wait_sec=%.2f "
-        "pick(pre_tool_z=%.1f, post_base_z=%.1f, retract_y=%.1f) place_pre_open=%s" %
+        "pick(pre_tool_z=%.1f, post_base_z=%.1f, retract_y=%.1f) place(pre_open=%s, top_dz=%.1f)" %
         (
             fr, fr_meta.get("raw", ""),
             tr, tr_meta.get("raw", ""),
             approach_dy, move_vel, move_acc, grip_wait_sec,
             pre_lift_tool_mm, post_lift_base_mm, retract_rel_y_mm,
-            str(place_pre_open),
+            str(place_pre_open), place_top_dz_mm
         )
     )
 
@@ -292,13 +279,16 @@ def perform_task(node):
         move_vel=move_vel,
         move_acc=move_acc,
         grip_wait_sec=grip_wait_sec,
+
         pre_lift_tool_mm=pre_lift_tool_mm,
         pre_lift_tool_vel=pre_lift_tool_vel,
         post_lift_base_mm=post_lift_base_mm,
         post_lift_base_vel=post_lift_base_vel,
         retract_rel_y_mm=retract_rel_y_mm,
         retract_rel_vel=retract_rel_vel,
+
         place_pre_open=place_pre_open,
+        place_top_dz_mm=place_top_dz_mm,
     )
     node.get_logger().info("[RESULT] ok=%s info=%s" % (str(ok), str(info)))
 
@@ -333,3 +323,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+

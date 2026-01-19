@@ -1,7 +1,7 @@
-# rack_pick_io v2.000 2026-01-19
+# rack_pick_io v2.100 2026-01-19
 # [이번 버전에서 수정된 사항]
-# - v2.000 기준 헤더 포맷 통일
-# - 기능별 주석(모듈 역할/시퀀스) 추가
+# - probe(접촉) 수행 전에 gripper를 CLOSE 상태로 만드는 옵션(pre_probe_close) 추가
+# - pick info에 pre_probe_close 기록 추가
 
 """[모듈] rack_pick_io
 
@@ -11,17 +11,19 @@
 [일반 흐름]
 1) approach로 안전 접근
 2) target 접근
-3) 그리퍼/프로브/리트랙트 등 Pick 시퀀스
+3) (옵션) probe 전에 gripper close
+4) probe(내부 retract 3mm 포함)
+5) 그리퍼 open -> pre lift -> close -> post lift -> retract
 """
 
 DEFAULT_GRIP_WAIT_SEC = 1.0
 
 # A) 집기 전 TOOL +Z
-DEFAULT_PRE_LIFT_TOOL_MM = 20.0
+DEFAULT_PRE_LIFT_TOOL_MM = 50.0
 DEFAULT_PRE_LIFT_TOOL_VEL = 20.0
 
 # B) 집은 후 BASE +Z
-DEFAULT_POST_LIFT_BASE_MM = 20.0
+DEFAULT_POST_LIFT_BASE_MM = 50.0
 DEFAULT_POST_LIFT_BASE_VEL = 20.0
 
 # 집은 후 BASE -Y retract
@@ -52,10 +54,13 @@ def rack_pick_only(
     move_vel=200,
     move_acc=200,
     align_to_retract_pose=False,
+    pre_probe_close=True,  # ✅ v2.100: probe 전에 gripper close
 ):
     """
-    [v1.500 Pick 시퀀스]
-      approach -> target -> probe(내부 retract 3mm 포함)
+    [Pick 시퀀스]
+      approach -> target
+      -> (옵션) pre_probe_close: grip_close
+      -> probe(내부 retract 3mm 포함)
       -> grip_open
       -> (A) TOOL +Z pre_lift_tool_mm
       -> grip_close
@@ -93,15 +98,25 @@ def rack_pick_only(
         node.get_logger().error("[%s][PICK] rel_move_base_fn is None" % str(tag))
         return False, {"reason": "rel_move_base_fn_none"}
 
-    node.get_logger().info("[%s][PICK] start" % str(tag))
+    node.get_logger().info("[%s][PICK] start (pre_probe_close=%s)" % (str(tag), str(bool(pre_probe_close))))
 
     # 1) approach -> target
     dr.movel(station["approach"], vel=move_vel, acc=move_acc)
     dr.movel(station["target"], vel=move_vel, acc=move_acc)
 
-    # 2) probe (내부 retract 3mm 포함)
+    # 2) (v2.100) probe 전에 gripper close
+    if pre_probe_close:
+        node.get_logger().info("[%s][PICK] pre-probe grip_close" % str(tag))
+        grip_close_fn(dr, wait_sec=gsec)
+
+    # 3) probe (내부 retract 3mm 포함)
     contacted, traveled, last_force = probe_fn(node, dr, "%s_PICK" % str(tag))
-    info = {"contacted": bool(contacted), "traveled": float(traveled), "last_force": last_force}
+    info = {
+        "contacted": bool(contacted),
+        "traveled": float(traveled),
+        "last_force": last_force,
+        "pre_probe_close": bool(pre_probe_close),
+    }
 
     if not contacted:
         node.get_logger().error("[%s][PICK][ABORT] no contact" % str(tag))
@@ -109,28 +124,28 @@ def rack_pick_only(
             dr.movel(station["approach"], vel=move_vel, acc=move_acc)
         return False, info
 
-    # 3) open
+    # 4) open (집기 준비)
     grip_open_fn(dr, wait_sec=gsec)
 
-    # 4) (A) 집기 전: TOOL +Z 20
+    # 5) (A) 집기 전: TOOL +Z
     if pre_z != 0.0:
         node.get_logger().info("[%s][PICK] pre-lift (TOOL) +Z %.1fmm" % (str(tag), pre_z))
         rel_move_tool_fn(dr, 0, 0, pre_z, 0, 0, 0, pre_v)
 
-    # 5) close (집기)
+    # 6) close (집기)
     grip_close_fn(dr, wait_sec=gsec)
 
-    # 6) (B) 집은 후: BASE +Z 20
+    # 7) (B) 집은 후: BASE +Z
     if post_z != 0.0:
         node.get_logger().info("[%s][PICK] post-lift (BASE) +Z %.1fmm" % (str(tag), post_z))
         rel_move_base_fn(dr, 0, 0, post_z, 0, 0, 0, post_v)
 
-    # 7) BASE -Y retract 100
+    # 8) BASE -Y retract
     if ry != 0.0:
         node.get_logger().info("[%s][RETRACT] BASE rel move: Y -%.1fmm" % (str(tag), ry))
         rel_move_base_fn(dr, 0, -ry, 0, 0, 0, 0, rvel)
 
-    # 8) optional align
+    # 9) optional align
     if align_to_retract_pose:
         dr.movel(station["retract"], vel=move_vel, acc=move_acc)
 

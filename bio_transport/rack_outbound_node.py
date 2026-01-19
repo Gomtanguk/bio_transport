@@ -236,7 +236,7 @@ def perform_task(node):
         grip_wait_sec=grip_wait_sec,
         move_vel=move_vel,
         move_acc=move_acc,
-        pre_open=True,
+        pre_open=False,
     )
 
     # 3) Place 후 후처리: BASE -Y50, +Z50
