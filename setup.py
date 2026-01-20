@@ -1,6 +1,8 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
-package_name = 'bio_transport'
+package_name = 'babo'
 
 setup(
     name=package_name,
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # 런치 파일 등록
+        (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*launch.py'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,13 +28,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'rack_transport = bio_transport.rack_transport_node:main',          # 파라미터 실행형
-        'rack_transport_server = bio_transport.rack_transport_server:main', # UI/토픽 대기형(신규 파일)
-        'rack_pick = bio_transport.rack_pick_node:main',
-        'bio_test = bio_transport.test_node:main',
-        'rack_transport_ui = bio_transport.rack_transport_ui:main',
-        'rack_inbound = bio_transport.rack_inbound_node:main',
-        'rack_outbound = bio_transport.rack_outbound_node:main',
+        'bio_main = babo.main_integrated:main',      # 메인 오케스트레이터
+        'bio_sub = babo.rack_transport_action:main',  # 하위 로봇 제어
+        'bio_ui = babo.ui_integrated:main',
         ],
     },
 )

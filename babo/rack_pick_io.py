@@ -124,30 +124,46 @@ def rack_pick_only(
             dr.movel(station["approach"], vel=move_vel, acc=move_acc)
         return False, info
 
-    # 4) open (집기 준비)
-    grip_open_fn(dr, wait_sec=gsec)
+    if contacted:
+        # dr 객체에 해당 함수가 있는지 확인하고 호출 (가장 안전한 방법)
+        if hasattr(dr, 'get_current_posx'):
+            actual_pos = dr.get_current_posx()
+        else:
+            # 시뮬레이션 등 함수가 없는 경우를 대비한 기본값 (예: 타겟 좌표 그대로 사용)
+            actual_pos = station["target"]
+            
+        node.get_logger().info(f"📍 현재 위치 확인: {actual_pos}")
 
-    # 5) (A) 집기 전: TOOL +Z
-    if pre_z != 0.0:
-        node.get_logger().info("[%s][PICK] pre-lift (TOOL) +Z %.1fmm" % (str(tag), pre_z))
-        rel_move_tool_fn(dr, 0, 0, pre_z, 0, 0, 0, pre_v)
 
-    # 6) close (집기)
-    grip_close_fn(dr, wait_sec=gsec)
+        # 4) open (집기 준비)
+        grip_open_fn(dr, wait_sec=gsec)
 
-    # 7) (B) 집은 후: BASE +Z
-    if post_z != 0.0:
-        node.get_logger().info("[%s][PICK] post-lift (BASE) +Z %.1fmm" % (str(tag), post_z))
-        rel_move_base_fn(dr, 0, 0, post_z, 0, 0, 0, post_v)
+        # 5) (A) 집기 전: TOOL +Z
+        if pre_z != 0.0:
+            node.get_logger().info("[%s][PICK] pre-lift (TOOL) +Z %.1fmm" % (str(tag), pre_z))
+            rel_move_tool_fn(dr, 0, 0, pre_z, 0, 0, 0, pre_v)
 
-    # 8) BASE -Y retract
-    if ry != 0.0:
-        node.get_logger().info("[%s][RETRACT] BASE rel move: Y -%.1fmm" % (str(tag), ry))
-        rel_move_base_fn(dr, 0, -ry, 0, 0, 0, 0, rvel)
+        # 6) close (집기)
+        grip_close_fn(dr, wait_sec=gsec)
 
-    # 9) optional align
-    if align_to_retract_pose:
-        dr.movel(station["retract"], vel=move_vel, acc=move_acc)
+        # 7) (B) 집은 후: BASE +Z
+        if post_z != 0.0:
+            node.get_logger().info("[%s][PICK] post-lift (BASE) +Z %.1fmm" % (str(tag), post_z))
+            # rel_move_base_fn(dr, 0, 0, post_z, 0, 0, 0, post_v)
+            # 보정된 퇴출(Retract) 예시
+            current_p = dr.get_current_posx()
+            # 현재 실제 높이에서 안전하게 50mm 더 들어올림 (절대 좌표 방식 보정)
+            retract_pos = [current_p[0], current_p[1], current_p[2] + 50.0, current_p[3], current_p[4], current_p[5]]
+            dr.movel(retract_pos, vel=post_v, acc=move_acc)
 
-    node.get_logger().info("[%s][PICK] success" % str(tag))
-    return True, info
+        # 8) BASE -Y retract
+        if ry != 0.0:
+            node.get_logger().info("[%s][RETRACT] BASE rel move: Y -%.1fmm" % (str(tag), ry))
+            rel_move_base_fn(dr, 0, -ry, 0, 0, 0, 0, rvel)
+
+        # 9) optional align
+        if align_to_retract_pose:
+            dr.movel(station["retract"], vel=move_vel, acc=move_acc)
+
+        node.get_logger().info("[%s][PICK] success" % str(tag))
+        return True, info
