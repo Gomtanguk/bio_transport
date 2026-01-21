@@ -1,44 +1,114 @@
-# rack_transport_action v2.800 2026-01-21
-# [수정 사항]
-# - ActionServer에 QoS(Reliable, Transient Local, KeepLast=5) 적용
-# - DoosanRealBridge.movel: vel/acc 필드를 list[2]로 변환하여 에러 수정
+# rack_transport_action v3.201 2026-01-21
+# [이번 버전에서 수정된 사항]
+# - (기능변경) /robot_action Action 서버에서 MOVE/IN/OUT 3가지 작업을 단일 파일로 통합 실행
+# - (기능변경) MOVE(Transport)는 요청하신 Pick&Place 시퀀스(Approach Y-250, Lift Z+30, Place Z+30, Retract Y-250)를 그대로 적용
+# - (구조정리) DSR_ROBOT2 import 위치/초기화 규칙 적용: (1) ROBOT 상수 바로 뒤 DR_init.__dsr__id/__dsr__model 1회 (2) main()에서 노드 생성 후 initialize_robot() 1회
+# - (안정화) rack 키 입력을 A-1 / a1 / A_1 형태로 받아 A-1로 정규화
+# - (버그수정) execute_callback에서 DSR_ROBOT2를 import 하며 g_node(None)로 크래시 나는 문제 해결 (main() 초기화 1회로 고정)
+
+"""[모듈] rack_transport_action
+
+[역할]
+- main_integrated에서 전달된 명령을 Action(RobotMove)로 받아 Doosan 로봇 동작을 실행한다.
+
+[Action]
+- name: /robot_action
+- goal.command payload 예시:
+  - MOVE,A-1,B-2
+  - IN,NONE,A-1
+  - OUT,A-1,NONE
+
+[MOVE(Transport) 시퀀스 - 요청 반영]
+1) Home 이동(안전 홈)
+2) Pick Approach: 타겟 기준 BASE Y -250mm
+3) Pick Target: 타겟 진입
+4) Grip Close: 파지
+5) Pick Lift: BASE Z +30mm 상승
+6) Pick Retract: BASE Y -250mm 후퇴 (Lift 상태 유지)
+7) Place Approach: 목적지 기준 BASE Z +30mm 상공 진입
+8) Place Target(Down): BASE Z -30mm 하강(=목적지 타겟)
+9) Grip Open: 놓기
+10) Place Retract: BASE Y -250mm 후퇴
+11) Home 이동(종료)
+
+"""
 
 from __future__ import annotations
 
-import math
-import time
-from typing import Dict, Optional, Sequence, Tuple
+import re
+from typing import Optional, Sequence, Tuple
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy  # ✅ QoS Import
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 import DR_init
-from biobank_interfaces.action import RobotMove
 
-# =========================
-# ROBOT 상수
-# =========================
+try:
+    from biobank_interfaces.action import RobotMove
+except ImportError:
+    # 타입/구문 체크용 더미
+    class RobotMove:  # pragma: no cover
+        class Goal:
+            command = ""
+        class Result:
+            def __init__(self, success=False, message=""):
+                self.success = success
+                self.message = message
+        class Feedback:
+            status = ""
+
+
+# ==========================================================
+# ROBOT 상수 (사용자 규칙: 파람/상수 정의 바로 뒤 DR_init 세팅 1회)
+# ==========================================================
 ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m0609"
 ROBOT_TOOL = "Tool Weight"
-ROBOT_TCP = "GripperDA_v1"
+ROBOT_TCP = "GripperDA"
 
-# =========================
-# DEFAULT_ 상수
-# =========================
-DEFAULT_MOVEJ_VEL = 60.0
-DEFAULT_MOVEJ_ACC = 60.0
-DEFAULT_MOVEJ_TIME = 2.0
+DR_init.__dsr__id = ROBOT_ID
+DR_init.__dsr__model = ROBOT_MODEL
 
-DEFAULT_MOVEL_VEL = 200.0
-DEFAULT_MOVEL_ACC = 200.0
-DEFAULT_MOVEL_TIME = 2.0
 
-HOME_J_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+# ==========================================================
+# 기본 모션 파라미터
+# ==========================================================
+V_J = 60
+A_J = 60
+
+V_L = 200.0
+A_L = 200.0
+
+# 느린 리프트/리트랙트용
+V_L_SLOW = 50.0
+A_L_SLOW = 50.0
+
+# 홈(조인트)
+HOME_J_DEG = (0.0, 0.0, 90.0, 0.0, 90.0, 0.0)
+
+# MOVE(Transport) 오프셋 (요청값)
+MOVE_PICK_APP_DY = -250.0
+MOVE_PICK_LIFT_DZ = 30.0
+MOVE_PICK_RET_DY = -250.0
+
+MOVE_PLACE_APP_DZ = 30.0
+MOVE_PLACE_RET_DY = -250.0
+
+# IN/OUT 기본값(기존 단발 노드 계열 - 안전한 기본)
+IN_WB_APP_DY = -50.0
+IN_RACK_APP_DY = -250.0
+IN_TOOL_LIFT_Z = 20.0
+IN_BASE_LIFT_Z = 250.0
+IN_TARGET_TOP_DZ = 20.0
+IN_FINAL_RETRACT_DY = -150.0
+
+OUT_RACK_APP_DY = -100.0
+OUT_WB_APP_DZ = 100.0
+GRIP_WAIT_SEC = 1.0
 
 
 def _norm(s: Optional[str]) -> Optional[str]:
@@ -50,465 +120,355 @@ def _norm(s: Optional[str]) -> Optional[str]:
     return t
 
 
+def _normalize_rack_key(raw: Optional[str]) -> str:
+    """A-1 / a_1 / A1 같은 입력을 A-1로 정규화"""
+    if raw is None:
+        return ""
+    s = str(raw).strip().upper()
+    s = s.replace("_", "-")
+    s = re.sub(r"\s+", "", s)
+
+    m = re.match(r"^([A-Z])\-([0-9]+)$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.match(r"^([A-Z])([0-9]+)$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return s
 
 
-class DoosanRealBridge:
-    ON = 1
-    OFF = 0
-    DR_BASE = 0
-    DR_TOOL = 1
+def _apply_offset(dr, pose: Sequence[float], dx=0.0, dy=0.0, dz=0.0):
+    """posx(x,y,z,rx,ry,rz) 형태에 오프셋 적용"""
+    return dr.posx(
+        float(pose[0]) + float(dx),
+        float(pose[1]) + float(dy),
+        float(pose[2]) + float(dz),
+        float(pose[3]),
+        float(pose[4]),
+        float(pose[5]),
+    )
 
-    def __init__(self, node: Node, robot_id: str):
-        self.node = node
-        self.ns = f"/{robot_id}"
 
-        from dsr_msgs2.srv import (
-            MoveJoint, MoveLine,
-            GetControlMode, GetRobotState, GetRobotMode,
-            SetRobotControl, SetRobotMode,
-            SetCurrentTool, SetCurrentTcp,
-            SetCtrlBoxDigitalOutput, SetToolDigitalOutput,
-        )
+def initialize_robot(node: Node):
+    """사용자 규칙: main()에서 노드 생성 후 1회만 호출."""
+    # ✅ DSR_ROBOT2 import 위치는 여기(함수 내부)로 고정
+    import DSR_ROBOT2 as dr
 
-        self.MoveJoint = MoveJoint
-        self.MoveLine = MoveLine
-        self.GetControlMode = GetControlMode
-        self.GetRobotState = GetRobotState
-        self.GetRobotMode = GetRobotMode
-        self.SetRobotControl = SetRobotControl
-        self.SetRobotMode = SetRobotMode
-        self.SetCurrentTool = SetCurrentTool
-        self.SetCurrentTcp = SetCurrentTcp
-        self.SetCtrlBoxDigitalOutput = SetCtrlBoxDigitalOutput
-        self.SetToolDigitalOutput = SetToolDigitalOutput
+    node.get_logger().info("#" * 50)
+    node.get_logger().info("Initializing robot with the following settings:")
+    node.get_logger().info(f"ROBOT_ID: {ROBOT_ID}")
+    node.get_logger().info(f"ROBOT_MODEL: {ROBOT_MODEL}")
+    node.get_logger().info(f"ROBOT_TCP: {ROBOT_TCP}")
+    node.get_logger().info(f"ROBOT_TOOL: {ROBOT_TOOL}")
+    node.get_logger().info("#" * 50)
 
-        self.cli_move_joint = node.create_client(MoveJoint, f"{self.ns}/motion/move_joint")
-        self.cli_move_line = node.create_client(MoveLine, f"{self.ns}/motion/move_line")
+    # (필요 시) 모드 설정
+    try:
+        dr.set_robot_mode(dr.ROBOT_MODE_AUTONOMOUS)
+    except Exception:
+        pass
 
-        self.cli_get_control_mode = node.create_client(GetControlMode, f"{self.ns}/aux_control/get_control_mode")
-        self.cli_get_robot_state = node.create_client(GetRobotState, f"{self.ns}/system/get_robot_state")
-        self.cli_get_robot_mode = node.create_client(GetRobotMode, f"{self.ns}/system/get_robot_mode")
+    # tool/tcp 1회 설정
+    dr.set_tool(ROBOT_TOOL)
+    dr.set_tcp(ROBOT_TCP)
 
-        self.cli_set_robot_control = node.create_client(SetRobotControl, f"{self.ns}/system/set_robot_control")
-        self.cli_set_robot_mode = node.create_client(SetRobotMode, f"{self.ns}/system/set_robot_mode")
-
-        self.cli_set_tool = node.create_client(SetCurrentTool, f"{self.ns}/tool/set_current_tool")
-        self.cli_set_tcp = node.create_client(SetCurrentTcp, f"{self.ns}/tcp/set_current_tcp")
-
-        self.cli_set_ctrl_do = node.create_client(SetCtrlBoxDigitalOutput, f"{self.ns}/io/set_ctrl_box_digital_output")
-        self.cli_set_tool_do = node.create_client(SetToolDigitalOutput, f"{self.ns}/io/set_tool_digital_output")
-
-    def wait(self, sec: float):
-        time.sleep(float(sec))
-
-    def _wait_future(self, fut, timeout_sec: float) -> bool:
-        t0 = time.monotonic()
-        while not fut.done():
-            if timeout_sec is not None and (time.monotonic() - t0) > timeout_sec:
-                return False
-            time.sleep(0.01)
-        return True
-
-    def _call(self, client, req, timeout_sec: float):
-        if not client.wait_for_service(timeout_sec=timeout_sec):
-            raise RuntimeError(f"Service not available: {client.srv_name}")
-        fut = client.call_async(req)
-        if not self._wait_future(fut, timeout_sec=timeout_sec):
-            raise TimeoutError(f"Service call timeout: {client.srv_name}")
-        return fut.result()
-
-    @staticmethod
-    def _deg_list_to_rad(j_deg: Sequence[float]) -> Sequence[float]:
-        return [math.radians(float(x)) for x in j_deg]
-
-    @staticmethod
-    def posj(*args) -> list:
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            return [float(x) for x in args[0]]
-        return [float(x) for x in args]
-
-    @staticmethod
-    def posx(*args) -> list:
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            return [float(x) for x in args[0]]
-        return [float(x) for x in args]
-
-    # ---- query ----
-    def get_control_mode(self) -> int:
-        req = self.GetControlMode.Request()
-        resp = self._call(self.cli_get_control_mode, req, timeout_sec=2.0)
-        return int(getattr(resp, "control_mode", -1))
-
-    def get_robot_state(self) -> int:
-        req = self.GetRobotState.Request()
-        resp = self._call(self.cli_get_robot_state, req, timeout_sec=2.0)
-        return int(getattr(resp, "robot_state", -1))
-
-    def get_robot_mode(self) -> int:
-        req = self.GetRobotMode.Request()
-        resp = self._call(self.cli_get_robot_mode, req, timeout_sec=2.0)
-        return int(getattr(resp, "robot_mode", -1))
-
-    # ---- optional setters ----
-    def set_robot_control(self, value: int):
-        req = self.SetRobotControl.Request()
-        for k, t in req._fields_and_field_types.items():
-            if t in ("int8", "int16", "int32", "uint8", "uint16", "uint32"):
-                setattr(req, k, int(value))
-                break
-        return self._call(self.cli_set_robot_control, req, timeout_sec=2.0)
-
-    def set_robot_mode(self, value: int):
-        req = self.SetRobotMode.Request()
-        if hasattr(req, "robot_mode"):
-            req.robot_mode = int(value)
-        elif hasattr(req, "mode"):
-            req.mode = int(value)
-        else:
-            slot = req.__slots__[0].lstrip("_")
-            setattr(req, slot, int(value))
-        return self._call(self.cli_set_robot_mode, req, timeout_sec=2.0)
-
-    def set_tool(self, tool_name: str):
-        req = self.SetCurrentTool.Request()
-        if hasattr(req, "name"):
-            req.name = str(tool_name)
-        elif hasattr(req, "tool_name"):
-            req.tool_name = str(tool_name)
-        else:
-            slot = req.__slots__[0].lstrip("_")
-            setattr(req, slot, str(tool_name))
-        return self._call(self.cli_set_tool, req, timeout_sec=2.0)
-
-    def set_tcp(self, tcp_name: str):
-        req = self.SetCurrentTcp.Request()
-        if hasattr(req, "name"):
-            req.name = str(tcp_name)
-        elif hasattr(req, "tcp_name"):
-            req.tcp_name = str(tcp_name)
-        else:
-            slot = req.__slots__[0].lstrip("_")
-            setattr(req, slot, str(tcp_name))
-        return self._call(self.cli_set_tcp, req, timeout_sec=2.0)
-
-    # ---- IO ----
-    def set_ctrl_box_digital_output(self, index: int, value: int):
-        req = self.SetCtrlBoxDigitalOutput.Request()
-        if hasattr(req, "index"): req.index = int(index)
-        elif hasattr(req, "port"): req.port = int(index)
-        elif hasattr(req, "channel"): req.channel = int(index)
-        else: setattr(req, req.__slots__[0].lstrip("_"), int(index))
-
-        if hasattr(req, "value"): req.value = int(value)
-        elif hasattr(req, "val"): req.val = int(value)
-        elif hasattr(req, "state"): req.state = int(value)
-        else: setattr(req, req.__slots__[1].lstrip("_"), int(value))
-        return self._call(self.cli_set_ctrl_do, req, timeout_sec=2.0)
-
-    def set_tool_digital_output(self, index: int, value: int):
-        req = self.SetToolDigitalOutput.Request()
-        if hasattr(req, "index"): req.index = int(index)
-        elif hasattr(req, "port"): req.port = int(index)
-        elif hasattr(req, "channel"): req.channel = int(index)
-        else: setattr(req, req.__slots__[0].lstrip("_"), int(index))
-
-        if hasattr(req, "value"): req.value = int(value)
-        elif hasattr(req, "val"): req.val = int(value)
-        elif hasattr(req, "state"): req.state = int(value)
-        else: setattr(req, req.__slots__[1].lstrip("_"), int(value))
-        return self._call(self.cli_set_tool_do, req, timeout_sec=2.0)
-
-    def set_digital_output(self, index: int, value: int):
-        try:
-            resp = self.set_ctrl_box_digital_output(index, value)
-            if hasattr(resp, "success") and not bool(resp.success):
-                raise RuntimeError("ctrl DO success=False")
-            return resp
-        except Exception as e:
-            self.node.get_logger().warn(f"[IO] ctrl DO failed -> try tool DO ({e})")
-            return self.set_tool_digital_output(index, value)
-
-    # ---- motion ----
-    def movej(self, j_deg: Sequence[float], vel: float, acc: float, t: float):
-        req = self.MoveJoint.Request()
-        req.pos = list(self._deg_list_to_rad(j_deg))
-        req.vel = float(vel)
-        req.acc = float(acc)
-        req.time = float(t)
-        return self._call(self.cli_move_joint, req, timeout_sec=12.0)
-
-    def movel(self, x: Sequence[float], vel: float, acc: float, t: float):
-        req = self.MoveLine.Request()
-        fields = req._fields_and_field_types
-        if "pos" in fields:
-            req.pos = [float(v) for v in x]
-        else:
-            for k in ("target", "posx", "x"):
-                if k in fields:
-                    setattr(req, k, [float(v) for v in x])
-                    break
-        
-        # ✅ [Fix] vel/acc must be length 2 (float[2])
-        if "vel" in fields:
-            req.vel = [float(vel), 0.0] 
-        if "acc" in fields:
-            req.acc = [float(acc), 0.0]
-            
-        if "time" in fields:
-            req.time = float(t)
-        return self._call(self.cli_move_line, req, timeout_sec=20.0)
+    return dr
 
 
 class RackTransportAction(Node):
     def __init__(self):
-        super().__init__("rack_transport_action", namespace=f"/{ROBOT_ID}")
+        super().__init__("rack_transport_action", namespace=ROBOT_ID)
 
+        # main()에서 주입
+        self.dr = None
+
+        # dry_run=True면 로봇 이동 없이 성공만 반환
         self.declare_parameter("dry_run", False)
-        self.declare_parameter("skip_probe", False)
 
-        self.declare_parameter("movej_vel", float(DEFAULT_MOVEJ_VEL))
-        self.declare_parameter("movej_acc", float(DEFAULT_MOVEJ_ACC))
-        self.declare_parameter("movej_time", float(DEFAULT_MOVEJ_TIME))
+        # station builders / targets
+        from .rack_stations import (
+            build_rack_stations,
+            build_workbench_station_dy,
+            build_workbench_station_top,
+            RACK_TARGETS,
+        )
+        self.RACK_TARGETS = RACK_TARGETS
+        self.build_rack_stations = build_rack_stations
+        self.build_wb_dy = build_workbench_station_dy
+        self.build_wb_top = build_workbench_station_top
 
-        self.declare_parameter("movel_vel", float(DEFAULT_MOVEL_VEL))
-        self.declare_parameter("movel_acc", float(DEFAULT_MOVEL_ACC))
-        self.declare_parameter("movel_time", float(DEFAULT_MOVEL_TIME))
-
-        self.declare_parameter("enable_set_robot_control", False)
-        self.declare_parameter("robot_control_value", 0)
-        self.declare_parameter("enable_set_robot_mode", False)
-        self.declare_parameter("robot_mode_value", 1)
-
-        DR_init.__dsr__node = self
-        DR_init.__dsr__id = ROBOT_ID
-        DR_init.__dsr__model = ROBOT_MODEL
-
-        self.dr = DoosanRealBridge(self, ROBOT_ID)
-
-        from babo.rack_stations import build_rack_stations, build_workbench_station_dy
-        self.rack_stations: Dict[str, Dict[str, list]] = build_rack_stations(self.dr, approach_dy=-250.0)
-        self.wb_station: Dict[str, list] = build_workbench_station_dy(self.dr)
-
-        from babo.gripper_io import grip_open, grip_close, grip_init_open
+        # IO helpers
+        from .gripper_io import grip_open, grip_close, grip_init_open
         self.grip_open = grip_open
         self.grip_close = grip_close
         self.grip_init_open = grip_init_open
 
-        # ✅ [QoS] Reliable + Transient Local 설정
-        custom_action_qos = QoSProfile(
+        # rel move helpers (IN/OUT에 사용)
+        from .rel_move import rel_movel_tool, rel_movel_base
+        self.rel_movel_tool = rel_movel_tool
+        self.rel_movel_base = rel_movel_base
+
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5
+            depth=5,
         )
 
+        # ✅ ACTION 이름(/robot_action)은 절대 변경 금지
         self._server = ActionServer(
             self,
             RobotMove,
             "/robot_action",
             execute_callback=self.execute_callback,
             callback_group=ReentrantCallbackGroup(),
-            # ✅ QoS 적용
-            goal_service_qos_profile=custom_action_qos,
-            result_service_qos_profile=custom_action_qos,
-            cancel_service_qos_profile=custom_action_qos,
-            feedback_pub_qos_profile=custom_action_qos,
-            status_pub_qos_profile=custom_action_qos
+            goal_service_qos_profile=qos,
+            result_service_qos_profile=qos,
+            cancel_service_qos_profile=qos,
+            feedback_pub_qos_profile=qos,
+            status_pub_qos_profile=qos,
         )
 
-        self._log_robot_status(prefix="[BOOT]")
-        self.get_logger().info("✅ [v2.800] rack_transport_action ready (QoS: Transient Local)")
+        self.get_logger().info("✅ [v3.200] /robot_action ready (MOVE/IN/OUT)")
 
-    def _log_robot_status(self, prefix: str):
-        try:
-            cm = self.dr.get_control_mode()
-            rs = self.dr.get_robot_state()
-            rm = self.dr.get_robot_mode()
-            self.get_logger().info(f"{prefix} control_mode={cm} robot_state={rs} robot_mode={rm}")
-        except Exception as e:
-            self.get_logger().warn(f"{prefix} status query failed: {e}")
+    def set_dr(self, dr):
+        self.dr = dr
 
-    def _ensure_ready(self) -> Tuple[bool, str]:
-        try:
-            self._log_robot_status(prefix="[PRE]")
+    def _home(self):
+        home_j = self.dr.posj(*HOME_J_DEG)
+        self.dr.movej(home_j, vel=V_J, acc=A_J)
 
-            if bool(self.get_parameter("enable_set_robot_control").value):
-                v = int(self.get_parameter("robot_control_value").value)
-                self.dr.set_robot_control(v)
-
-            if bool(self.get_parameter("enable_set_robot_mode").value):
-                v = int(self.get_parameter("robot_mode_value").value)
-                self.dr.set_robot_mode(v)
-
-            try:
-                self.dr.set_tool(ROBOT_TOOL)
-            except Exception as e:
-                self.get_logger().warn(f"[INIT] set_tool failed: {e}")
-            try:
-                self.dr.set_tcp(ROBOT_TCP)
-            except Exception as e:
-                self.get_logger().warn(f"[INIT] set_tcp failed: {e}")
-
-            self._log_robot_status(prefix="[POST]")
-            return True, "ready"
-        except Exception as e:
-            return False, f"ensure_ready failed: {e}"
+    def _valid_keys(self):
+        keys = list(self.RACK_TARGETS.keys())
+        keys.sort()
+        return keys
 
     async def execute_callback(self, goal_handle):
-        raw_cmd = (goal_handle.request.command or "").strip()
-        self.get_logger().info(f"📥 cmd: {raw_cmd}")
+        cmd = (goal_handle.request.command or "").strip()
+        self.get_logger().info(f"📥 EXEC: {cmd}")
 
         if bool(self.get_parameter("dry_run").value):
             goal_handle.succeed()
-            return RobotMove.Result(success=True, message="[DRY_RUN] success")
+            return RobotMove.Result(success=True, message="Dry Run Success")
 
-        ok, msg = self._ensure_ready()
-        if not ok:
+        if self.dr is None:
             goal_handle.abort()
-            return RobotMove.Result(success=False, message=msg)
+            return RobotMove.Result(success=False, message="Robot not initialized (dr is None)")
 
-        parts = [p.strip() for p in raw_cmd.split(",")]
-        cmd = parts[0].upper() if parts else ""
-        a = _norm(parts[1]) if len(parts) > 1 else None
-        b = _norm(parts[2]) if len(parts) > 2 else None
+        parts = [p.strip() for p in cmd.split(",") if p.strip() != ""]
+        op = parts[0].upper() if parts else ""
+        a1 = _norm(parts[1]) if len(parts) > 1 else None
+        a2 = _norm(parts[2]) if len(parts) > 2 else None
+
+        src = _normalize_rack_key(a1) if a1 else None
+        dst = _normalize_rack_key(a2) if a2 else None
 
         try:
-            if cmd == "IN":
-                dest = b if b else a
-                if not dest: raise ValueError("IN needs dest")
-                ok, m = self._do_in(dest)
-            elif cmd == "OUT":
-                src = a
-                if not src: raise ValueError("OUT needs src")
-                ok, m = self._do_out(src)
-            elif cmd == "MOVE":
-                src, dest = a, b
-                if not src or not dest: raise ValueError("MOVE needs src,dest")
-                ok, m = self._do_move(src, dest)
+            if op == "MOVE":
+                if not src or not dst:
+                    raise ValueError("MOVE requires src & dest")
+                ok, msg = self._do_transport(src, dst)
+
+            elif op == "IN":
+                # IN,NONE,A-1 형태 권장 (src는 무시)
+                if not dst:
+                    raise ValueError("IN requires dest")
+                ok, msg = self._do_inbound(dst)
+
+            elif op == "OUT":
+                if not src:
+                    raise ValueError("OUT requires src")
+                ok, msg = self._do_outbound(src)
+
             else:
-                raise ValueError(f"unknown cmd={cmd}")
+                ok, msg = False, f"Unknown op: {op}"
+
         except Exception as e:
-            ok, m = False, f"error: {e}"
-            self.get_logger().error(m)
+            ok, msg = False, f"Error: {e}"
 
         if ok:
-            self.get_logger().info(f"[RESULT] ok=True cmd={raw_cmd} msg={m}")
             goal_handle.succeed()
         else:
-            self.get_logger().error(f"[RESULT] ok=False cmd={raw_cmd} msg={m}")
             goal_handle.abort()
 
-        return RobotMove.Result(success=ok, message=m)
+        return RobotMove.Result(success=ok, message=msg)
 
-    def _do_in(self, dest: str) -> Tuple[bool, str]:
-        if dest not in self.rack_stations:
-            return False, f"unknown rack: {dest}"
+    # ==========================================================
+    # MOVE (Transport) - 요청 시퀀스 적용
+    # ==========================================================
+    def _do_transport(self, src: str, dest: str) -> Tuple[bool, str]:
+        valid = self._valid_keys()
+        if src not in valid or dest not in valid:
+            return False, f"Invalid rack key: src={src}, dest={dest}"
+        if src == dest:
+            return False, "src == dest"
 
-        vj = float(self.get_parameter("movej_vel").value)
-        aj = float(self.get_parameter("movej_acc").value)
-        tj = float(self.get_parameter("movej_time").value)
+        self.get_logger().info(f"[MOVE] {src} -> {dest}")
 
-        vl = float(self.get_parameter("movel_vel").value)
-        al = float(self.get_parameter("movel_acc").value)
-        tl = float(self.get_parameter("movel_time").value)
+        rack = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
+        st_src = rack[src]
+        st_dst = rack[dest]
 
-        st = self.rack_stations[dest]
-        wb = self.wb_station
+        # 1) Home
+        self._home()
+        self.grip_init_open(self.dr, wait_sec=0.2)
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        self.grip_init_open(self.dr)
+        # 2) Pick Approach: target 기준 BASE Y -250
+        pick_app = _apply_offset(self.dr, st_src["target"], dy=MOVE_PICK_APP_DY)
+        self.dr.movel(pick_app, vel=V_L, acc=A_L)
 
-        self.dr.movel(wb["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(wb["target"], vel=vl, acc=al, t=tl)
-        
-        # (Real Probe Logic would go here)
-        
-        self.grip_close(self.dr)
-        self.dr.movel(wb["approach"], vel=vl, acc=al, t=tl)
+        # 3) Pick Target
+        self.dr.movel(st_src["target"], vel=V_L, acc=A_L)
 
-        self.dr.movel(st["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(st["target"], vel=vl, acc=al, t=tl)
-        self.grip_open(self.dr)
-        self.dr.movel(st["approach"], vel=vl, acc=al, t=tl)
+        # 4) Grip Close
+        self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        return True, f"inbound to {dest} done"
+        # 5) Pick Lift: BASE Z +30
+        pick_lift = _apply_offset(self.dr, st_src["target"], dz=MOVE_PICK_LIFT_DZ)
+        self.dr.movel(pick_lift, vel=V_L_SLOW, acc=A_L_SLOW)
 
-    def _do_out(self, src: str) -> Tuple[bool, str]:
-        if src not in self.rack_stations:
-            return False, f"unknown rack: {src}"
+        # 6) Pick Retract: BASE Y -250 (Lift 유지)
+        pick_ret = _apply_offset(self.dr, pick_lift, dy=MOVE_PICK_RET_DY)
+        self.dr.movel(pick_ret, vel=V_L_SLOW, acc=A_L_SLOW)
 
-        vj = float(self.get_parameter("movej_vel").value)
-        aj = float(self.get_parameter("movej_acc").value)
-        tj = float(self.get_parameter("movej_time").value)
+        # 7) Place Approach: 목적지 기준 BASE Z +30
+        place_app = _apply_offset(self.dr, st_dst["target"], dz=MOVE_PLACE_APP_DZ)
+        self.dr.movel(place_app, vel=V_L, acc=A_L)
 
-        vl = float(self.get_parameter("movel_vel").value)
-        al = float(self.get_parameter("movel_acc").value)
-        tl = float(self.get_parameter("movel_time").value)
+        # 8) Place Target(Down): = target
+        self.dr.movel(st_dst["target"], vel=V_L, acc=A_L)
 
-        st = self.rack_stations[src]
-        wb = self.wb_station
+        # 9) Grip Open
+        self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        self.grip_init_open(self.dr)
+        # 10) Place Retract: BASE Y -250
+        place_ret = _apply_offset(self.dr, st_dst["target"], dy=MOVE_PLACE_RET_DY)
+        self.dr.movel(place_ret, vel=V_L_SLOW, acc=A_L_SLOW)
 
-        self.dr.movel(st["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(st["target"], vel=vl, acc=al, t=tl)
-        self.grip_close(self.dr)
-        self.dr.movel(st["approach"], vel=vl, acc=al, t=tl)
+        # 11) Home
+        self._home()
 
-        self.dr.movel(wb["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(wb["target"], vel=vl, acc=al, t=tl)
-        self.grip_open(self.dr)
-        self.dr.movel(wb["approach"], vel=vl, acc=al, t=tl)
+        return True, "Transport Done"
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        return True, f"outbound from {src} done"
+    # ==========================================================
+    # INBOUND : WORKBENCH -> RACK
+    # ==========================================================
+    def _do_inbound(self, dest: str) -> Tuple[bool, str]:
+        valid = self._valid_keys()
+        if dest not in valid:
+            return False, f"Invalid rack key: dest={dest}"
 
-    def _do_move(self, src: str, dest: str) -> Tuple[bool, str]:
-        if src not in self.rack_stations or dest not in self.rack_stations:
-            return False, f"unknown rack: {src}->{dest}"
+        self.get_logger().info(f"[IN] WB -> {dest}")
 
-        vj = float(self.get_parameter("movej_vel").value)
-        aj = float(self.get_parameter("movej_acc").value)
-        tj = float(self.get_parameter("movej_time").value)
+        wb = self.build_wb_dy(self.dr, approach_dy=IN_WB_APP_DY)
+        rack = self.build_rack_stations(self.dr, approach_dy=IN_RACK_APP_DY)
+        st = rack[dest]
 
-        vl = float(self.get_parameter("movel_vel").value)
-        al = float(self.get_parameter("movel_acc").value)
-        tl = float(self.get_parameter("movel_time").value)
+        self._home()
+        self.grip_init_open(self.dr, wait_sec=0.2)
 
-        st_src = self.rack_stations[src]
-        st_dst = self.rack_stations[dest]
+        # WB approach -> target
+        self.rel_movel_base(self.dr, 0, -180.0, 0, 0, 0, 0, 50.0)
+        self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
+        self.dr.movel(wb["target"], vel=V_L, acc=A_L)
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        self.grip_init_open(self.dr)
+        # Tool 상대 +Z lift
+        self.rel_movel_tool(self.dr, 0, 0, IN_TOOL_LIFT_Z, 0, 0, 0, 20.0)
 
-        self.dr.movel(st_src["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(st_src["target"], vel=vl, acc=al, t=tl)
-        self.grip_close(self.dr)
-        self.dr.movel(st_src["approach"], vel=vl, acc=al, t=tl)
+        # Grip close
+        self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        self.dr.movel(st_dst["approach"], vel=vl, acc=al, t=tl)
-        self.dr.movel(st_dst["target"], vel=vl, acc=al, t=tl)
-        self.grip_open(self.dr)
-        self.dr.movel(st_dst["approach"], vel=vl, acc=al, t=tl)
+        # Base 상대 +Z 크게 lift
+        self.rel_movel_base(self.dr, 0, 0, IN_BASE_LIFT_Z, 0, 0, 0, 50.0)
 
-        self.dr.movej(HOME_J_DEG, vel=vj, acc=aj, t=tj)
-        return True, f"move {src}->{dest} done"
+        # Rack approach -> top -> target
+        self.dr.movel(st["approach"], vel=V_L, acc=A_L)
+        top = _apply_offset(self.dr, st["target"], dz=IN_TARGET_TOP_DZ)
+        self.dr.movel(top, vel=V_L, acc=A_L)
+        self.dr.movel(st["target"], vel=V_L, acc=A_L)
+
+        # Grip open
+        self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
+
+        # retract
+        ret = _apply_offset(self.dr, st["target"], dy=IN_FINAL_RETRACT_DY)
+        self.dr.movel(ret, vel=V_L_SLOW, acc=A_L_SLOW)
+
+        self._home()
+        return True, "Inbound Done"
+
+    # ==========================================================
+    # OUTBOUND : RACK -> WORKBENCH
+    # ==========================================================
+    def _do_outbound(self, src: str) -> Tuple[bool, str]:
+        valid = self._valid_keys()
+        if src not in valid:
+            return False, f"Invalid rack key: src={src}"
+
+        self.get_logger().info(f"[OUT] {src} -> WB")
+
+        rack = self.build_rack_stations(self.dr, approach_dy=OUT_RACK_APP_DY)
+        wb = self.build_wb_top(self.dr, approach_dz=OUT_WB_APP_DZ)
+        st = rack[src]
+
+        self._home()
+        self.grip_init_open(self.dr, wait_sec=0.2)
+
+        # Rack approach -> target
+        self.rel_movel_base(self.dr, 0, -100.0, 0, 0, 0, 0, 50.0)
+        self.dr.movel(st["approach"], vel=V_L, acc=A_L)
+        self.dr.movel(st["target"], vel=V_L, acc=A_L)
+
+        # Grip close
+        self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
+
+        # Lift up slightly (tool Z)
+        self.rel_movel_tool(self.dr, 0, 0, IN_TOOL_LIFT_Z, 0, 0, 0, 20.0)
+
+        # Retract (base Y -250mm) : OUT_RACK_APP_DY와 반대 방향으로 안전 후퇴
+        self.rel_movel_base(self.dr, 0, -250.0, 0, 0, 0, 0, 50.0)
+
+        # WB approach(top) -> target(top)
+        self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
+        self.dr.movel(wb["target"], vel=V_L, acc=A_L)
+
+        # Grip open
+        self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
+
+        # Post retract: base -Y50, +Z50
+        self.rel_movel_base(self.dr, 0, -50.0, 0, 0, 0, 0, 50.0)
+        self.rel_movel_base(self.dr, 0, 0, 50.0, 0, 0, 0, 50.0)
+
+        self._home()
+        return True, "Outbound Done"
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = RackTransportAction()
+
+    # ✅ 사용자 규칙: main()에서 노드 생성 후 1회 초기화
+    DR_init.__dsr__node = node
+    dr = initialize_robot(node)
+    node.set_dr(dr)
+
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
+
     try:
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()

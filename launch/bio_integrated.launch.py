@@ -13,7 +13,7 @@ def generate_launch_description():
     # =========================================================
     # 1. 런치 인자 설정 (터미널에서 변경 가능하도록)
     # =========================================================
-    # 기본 모드: virtual
+    # 기본 모드: real
     mode_arg = DeclareLaunchArgument('mode', default_value='virtual')
     host_arg = DeclareLaunchArgument('host', default_value='127.0.0.1')
     
