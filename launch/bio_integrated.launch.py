@@ -10,12 +10,30 @@ def generate_launch_description():
     package_name = 'babo'
     dsr_bringup2_dir = get_package_share_directory('dsr_bringup2')
     
-    # 인자 설정
-    mode_arg = DeclareLaunchArgument('mode', default_value='virtual')
-    # 로컬 에뮬레이터 사용 시 127.0.0.1이 더 안정적일 수 있음
-    host_arg = DeclareLaunchArgument('host', default_value='127.0.0.1')
+    # =========================================================
+    # 1. 런치 인자 설정 (터미널에서 변경 가능하도록)
+    # =========================================================
+    # 기본 모드: virtual
+    mode_arg = DeclareLaunchArgument('mode', default_value='real')
+    host_arg = DeclareLaunchArgument('host', default_value='192.168.1.100')
+    
+    # [중요] 아까 테스트 성공했던 파라미터를 여기서도 쓸 수 있게 추가
+    dry_run_arg = DeclareLaunchArgument(
+        'dry_run', 
+        default_value='False', 
+        description='Set to True to bypass robot connection'
+    )
+    skip_probe_arg = DeclareLaunchArgument(
+        'skip_probe', 
+        default_value='True', 
+        description='Set to True to skip sensor check in virtual mode'
+    )
 
-    # 1. 두산 로봇 드라이버/에뮬레이터 실행
+    # =========================================================
+    # 2. 노드 실행 정의
+    # =========================================================
+    
+    # (A) 두산 로봇 에뮬레이터/RViz 실행
     dsr_simulator = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(dsr_bringup2_dir, 'launch', 'dsr_bringup2_rviz.launch.py')
@@ -26,21 +44,25 @@ def generate_launch_description():
             'model': 'm0609',
             'port': '12345'
         }.items()
-)
+    )
 
-    # 2. 로봇 제어 서버 (bio_sub) - 15초 후 실행
-    # 에뮬레이터가 12345 포트를 완전히 열 때까지 충분히 기다림
+    # (B) 로봇 제어 서버 (bio_sub) - 15초 후 실행
+    # [수정] parameters 옵션을 통해 dry_run/skip_probe 값을 전달
     sub_node = TimerAction(
         period=15.0,
         actions=[Node(
             package=package_name,
             executable='bio_sub',
             name='rack_transport_action',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'dry_run': LaunchConfiguration('dry_run'),
+                'skip_probe': LaunchConfiguration('skip_probe')
+            }]
         )]
     )
 
-    # 3. 메인 노드 (bio_main) - 18초 후 실행
+    # (C) 메인 오케스트레이터 (bio_main) - 18초 후 실행
     main_node = TimerAction(
         period=18.0,
         actions=[Node(
@@ -51,7 +73,7 @@ def generate_launch_description():
         )]
     )
 
-    # 4. UI 노드 (bio_ui) - 20초 후 실행
+    # (D) UI 노드 (bio_ui) - 20초 후 실행
     ui_node = TimerAction(
         period=20.0,
         actions=[Node(
@@ -63,8 +85,12 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        # 인자 등록
         mode_arg,
         host_arg,
+        dry_run_arg,
+        skip_probe_arg,
+        # 실행 그룹
         dsr_simulator,
         sub_node,
         main_node,
