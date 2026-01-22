@@ -64,40 +64,44 @@ DR_init.__dsr__model = ROBOT_MODEL
 # ==========================================================
 # 기본 모션 파라미터
 # ==========================================================
-V_J = 60
-A_J = 60
-
 VELOCITY = 60
 ACC = 60
+
+
+# [Pick 관련 파라미터]
+DEFAULT_PICK_PRE_TOOL_MM = 18.0   # 잡기 전 Tool Z축 상승
+DEFAULT_PICK_POST_BASE_MM = 30.0  # 잡은 후 Base Z축 상승
+
+V_J = 60
+A_J = 60
 
 V_L = 200.0
 A_L = 200.0
 
-# 느린 리프트/리트랙트용
 V_L_SLOW = 50.0
 A_L_SLOW = 50.0
+
+# [Pick 관련 파라미터]
+DEFAULT_PICK_PRE_TOOL_MM = 18.0   # 잡기 전 Tool Z축 상승
+DEFAULT_PICK_POST_BASE_MM = 30.0  # 잡은 후 Base Z축 상승
 
 # 홈(조인트)
 HOME_J_DEG = (0.0, 0.0, 90.0, 0.0, 90.0, 0.0)
 
-# MOVE(Transport) 오프셋 (요청값)
-MOVE_PICK_APP_DY = -250.0
-MOVE_PICK_LIFT_DZ = 30.0
-MOVE_PICK_RET_DY = -250.0
-
-MOVE_PLACE_APP_DZ = 30.0
-MOVE_PLACE_RET_DY = -150.0
+# MOVE(Transport) 관련 상수
+MOVE_PICK_APP_DY = -100.0   # 1. 픽 접근 시 Y -100mm
+MOVE_RETRACT_DY = -300.0    # 2. 픽 후퇴 시 Y -300mm
+MOVE_PLACE_APP_DZ = 60.0 
 
 # IN/OUT 기본값
 IN_WB_APP_DY = -50.0
-IN_RACK_APP_DY = -250.0
-IN_TOOL_LIFT_Z = 20.0
-IN_BASE_LIFT_Z = 250.0
-IN_TARGET_TOP_DZ = 20.0
-IN_FINAL_RETRACT_DY = -150.0
+IN_RACK_APP_DY = -100.0
+IN_BASE_LIFT_Z = 250.0    
 
-OUT_RACK_APP_DY = -250.0
-OUT_WB_APP_DZ = 100.0
+OUT_RACK_APP_DY = -100.0
+OUT_WB_APP_DZ = 200.0     
+OUT_WB_POST_X_MM = 200.0
+
 GRIP_WAIT_SEC = 1.0
 
 # =========================
@@ -332,55 +336,101 @@ class RackTransportAction(Node):
     def _do_transport(self, src: str, dest: str) -> Tuple[bool, str]:
         valid = self._valid_keys()
         if src not in valid or dest not in valid:
-            return False, f"Invalid rack key: src={src}, dest={dest}"
+            return False, f"Invalid keys: {src}->{dest}"
         if src == dest:
             return False, "src == dest"
 
         self.get_logger().info(f"[MOVE] {src} -> {dest}")
 
-        rack = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
-        st_src = rack[src]
-        st_dst = rack[dest]
+        # Pick 시 Y -100mm 접근
+        rack_pick = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
+        # Place 시 일단 접근 좌표 계산용
+        rack_place = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
+        
+        st_src = rack_pick[src]
+        st_dst = rack_place[dest]
 
-        # 1) Home
+        # 1) Home & Init
         self._home()
         self.grip_init_open(self.dr, wait_sec=0.2)
 
-        # 2) Pick Approach
-        pick_app = _apply_offset(self.dr, st_src["target"], dy=MOVE_PICK_APP_DY)
-        self.dr.movel(pick_app, vel=V_L, acc=A_L)
-
-        # 3) Pick Target
+        # ------------------------------------------------------
+        # [PICK SEQUENCE]
+        # ------------------------------------------------------
+        # 1-1. Y -100mm 접근
+        self.dr.movel(st_src["approach"], vel=V_L, acc=A_L)
+        
+        # 1-2. Target 진입
         self.dr.movel(st_src["target"], vel=V_L, acc=A_L)
 
-        # 4) Grip Close
+        # 1-3. Pre-Lift (Tool +Z)
+        if DEFAULT_PICK_PRE_TOOL_MM > 0:
+            self.rel_movel_tool(self.dr, 0, 0, DEFAULT_PICK_PRE_TOOL_MM, 0, 0, 0, V_L_SLOW)
+
+        # 1-4. Grip
         self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        # 5) Pick Lift
-        pick_lift = _apply_offset(self.dr, st_src["target"], dz=MOVE_PICK_LIFT_DZ)
-        self.dr.movel(pick_lift, vel=V_L_SLOW, acc=A_L_SLOW)
+        # 1-5. Post-Lift (Base +Z)
+        if DEFAULT_PICK_POST_BASE_MM > 0:
+            self.rel_movel_base(self.dr, 0, 0, DEFAULT_PICK_POST_BASE_MM, 0, 0, 0, V_L_SLOW)
 
-        # 6) Pick Retract
-        pick_ret = _apply_offset(self.dr, pick_lift, dy=MOVE_PICK_RET_DY)
-        self.dr.movel(pick_ret, vel=V_L_SLOW, acc=A_L_SLOW)
+        # 1-6. Retract (-300mm)
+        self.rel_movel_base(self.dr, 0, MOVE_RETRACT_DY, 0, 0, 0, 0, V_L)
+        # ------------------------------------------------------
 
-        # 7) Place Approach
-        place_app = _apply_offset(self.dr, st_dst["target"], dz=MOVE_PLACE_APP_DZ)
+        # ======================================================
+        # [LATERAL MOVE] Home 안 들르고 X축 수평 이동
+        # ======================================================
+        current_pos = self.dr.get_current_posx()[0] 
+        target_x = st_dst["target"][0] # Destination Rack의 기본 X 좌표
+        
+        # 안전을 위해 현재 높이(Z)와 깊이(Y)를 유지하고 X만 변경하여 movel
+        lateral_pos = self.dr.posx(
+            target_x,           
+            current_pos[1],     # Current Y (Retracted)
+            current_pos[2],     # Current Z (Retracted/Lifted)
+            current_pos[3],     
+            current_pos[4],     
+            current_pos[5]      
+        )
+        
+        self.get_logger().info(f"[MOVE] Sliding X to {dest}...")
+        self.dr.movel(lateral_pos, vel=V_L, acc=A_L)
+        # ======================================================
+
+        # ------------------------------------------------------
+        # [PLACE SEQUENCE] (With ID-specific Y offset)
+        # ------------------------------------------------------
+        
+        # [요청사항] 목적지 ID별 추가 Y 깊이 설정
+        y_offset = 0.0
+        if dest == "A-2":
+            y_offset = 23.0
+        elif dest in ["A-3", "B-1"]:
+            y_offset = 20.0
+        elif dest == "B-2":
+            y_offset = 10.0
+        
+        # 오프셋이 적용된 최종 타겟 좌표 계산
+        final_target = _apply_offset(self.dr, st_dst["target"], dy=y_offset)
+        
+        self.get_logger().info(f"[MOVE] Place logic: Dest={dest}, Added Y={y_offset}mm")
+
+        # 2-1. Approach (최종 타겟 기준 위에서 접근)
+        place_app = _apply_offset(self.dr, final_target, dz=MOVE_PLACE_APP_DZ)
         self.dr.movel(place_app, vel=V_L, acc=A_L)
+        
+        # 2-2. Target Place (깊이 보정된 위치)
+        self.dr.movel(final_target, vel=V_L, acc=A_L)
 
-        # 8) Place Target
-        self.dr.movel(st_dst["target"], vel=V_L, acc=A_L)
-
-        # 9) Grip Open
+        # 2-3. Open
         self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        # 10) Place Retract
-        place_ret = _apply_offset(self.dr, st_dst["target"], dy=MOVE_PLACE_RET_DY)
-        self.dr.movel(place_ret, vel=V_L_SLOW, acc=A_L_SLOW)
+        # 2-4. Retract
+        # 빠져나올 때는 안전하게 뒤로(Y -300)
+        self.rel_movel_base(self.dr, 0, MOVE_RETRACT_DY, 0, 0, 0, 0, V_L)
 
-        # 11) Home
         self._home()
-
         return True, "Transport Done"
 
     # ==========================================================
@@ -389,7 +439,7 @@ class RackTransportAction(Node):
     def _do_inbound(self, dest: str) -> Tuple[bool, str]:
         valid = self._valid_keys()
         if dest not in valid:
-            return False, f"Invalid rack key: dest={dest}"
+            return False, f"Invalid rack key: {dest}"
 
         self.get_logger().info(f"[IN] WB -> {dest}")
 
@@ -405,18 +455,19 @@ class RackTransportAction(Node):
         self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
         self.dr.movel(wb["target"], vel=V_L, acc=A_L)
 
-        # Tool Lift
-        # self.rel_movel_tool(self.dr, 0, 0, IN_TOOL_LIFT_Z, 0, 0, 0, 20.0)
+        # Pre-Lift (Tool +Z)
+        if DEFAULT_PICK_PRE_TOOL_MM > 0:
+            self.rel_movel_tool(self.dr, 0, 0, DEFAULT_PICK_PRE_TOOL_MM, 0, 0, 0, 20.0)
 
-        # Grip close
+        # Grip
         self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        # Base Lift
+        # Post-Lift (Base +Z)
         self.rel_movel_base(self.dr, 0, 0, IN_BASE_LIFT_Z, 0, 0, 0, 50.0)
 
         # Rack approach -> top -> target
         self.dr.movel(st["approach"], vel=V_L, acc=A_L)
-        top = _apply_offset(self.dr, st["target"], dz=IN_TARGET_TOP_DZ)
+        top = _apply_offset(self.dr, st["target"], dz=20.0)
         self.dr.movel(top, vel=V_L, acc=A_L)
         self.dr.movel(st["target"], vel=V_L, acc=A_L)
 
@@ -424,11 +475,10 @@ class RackTransportAction(Node):
         self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
 
         # retract
-        ret = _apply_offset(self.dr, st["target"], dy=IN_FINAL_RETRACT_DY)
+        ret = _apply_offset(self.dr, st["target"], dy=-150.0)
         self.dr.movel(ret, vel=V_L_SLOW, acc=A_L_SLOW)
 
         self._home()
-        self.get_logger().info(f"끝났어요!")
         return True, "Inbound Done"
 
     # ==========================================================
@@ -437,7 +487,7 @@ class RackTransportAction(Node):
     def _do_outbound(self, src: str) -> Tuple[bool, str]:
         valid = self._valid_keys()
         if src not in valid:
-            return False, f"Invalid rack key: src={src}"
+            return False, f"Invalid rack key: {src}"
 
         self.get_logger().info(f"[OUT] {src} -> WB")
 
@@ -448,19 +498,24 @@ class RackTransportAction(Node):
         self._home()
         self.grip_init_open(self.dr, wait_sec=0.2)
 
-        # Rack approach -> target
-        self.rel_movel_base(self.dr, 0, -150.0, 0, 0, 0, 0, 50.0)
+        # ------------------------------------------------------
+        # [PICK SEQUENCE] from Rack
+        # ------------------------------------------------------
+        self.rel_movel_base(self.dr, 0, -100.0, 0, 0, 0, 0, 50.0)
+        
         self.dr.movel(st["approach"], vel=V_L, acc=A_L)
         self.dr.movel(st["target"], vel=V_L, acc=A_L)
 
-        # Grip close
+        if DEFAULT_PICK_PRE_TOOL_MM > 0:
+            self.rel_movel_tool(self.dr, 0, 0, DEFAULT_PICK_PRE_TOOL_MM, 0, 0, 0, 20.0)
+
         self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        # Lift
-        self.rel_movel_tool(self.dr, 0, 0, IN_TOOL_LIFT_Z, 0, 0, 0, 20.0)
-
-        # Retract
+        if DEFAULT_PICK_POST_BASE_MM > 0:
+            self.rel_movel_base(self.dr, 0, 0, DEFAULT_PICK_POST_BASE_MM, 0, 0, 0, 20.0)
+        
         self.rel_movel_base(self.dr, 0, -250.0, 0, 0, 0, 0, 50.0)
+        # ------------------------------------------------------
 
         # WB approach -> target
         self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
@@ -469,9 +524,13 @@ class RackTransportAction(Node):
         # Grip open
         self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
 
-        # Post retract
+        # Post Retract Sequence: Y -> X -> Z
         self.rel_movel_base(self.dr, 0, -50.0, 0, 0, 0, 0, 50.0)
-        self.rel_movel_base(self.dr, 0, 0, 200.0, 0, 0, 0, 50.0)
+
+        if OUT_WB_POST_X_MM > 0:
+            self.rel_movel_base(self.dr, OUT_WB_POST_X_MM, 0, 0, 0, 0, 0, 50.0)
+
+        self.rel_movel_base(self.dr, 0, 0, 50.0, 0, 0, 0, 50.0)
 
         self._home()
         return True, "Outbound Done"

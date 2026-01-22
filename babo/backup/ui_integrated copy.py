@@ -502,19 +502,20 @@ class UiActionClientNode(Node):
         self.ui.log_t1("✅ [Tube] Goal 수락")
         res_future = goal_handle.get_result_async()
         res_future.add_done_callback(self._on_tube_result)
-        
+
     def _on_tube_result(self, future):
         try:
             res = future.result().result
             success = bool(getattr(res, "success", False))
             msg = str(getattr(res, "message", ""))
-            err = str(getattr(res, "error_code", ""))  # 에러 코드 추출 추가
-            
-            # 정의된 대로 3개의 인자를 전달하도록 수정
-            self.ui.on_tube_action_result(success, err, msg) 
-            
+            err = str(getattr(res, "error_code", ""))
+            if err:
+                msg = f"{err}: {msg}"
         except Exception as e:
-            self.ui.on_tube_action_result(False, "EXCEPTION", f"Result exception: {e}")
+            success = False
+            msg = f"Result exception: {e}"
+
+        self.ui.on_tube_action_result(success, msg)
 
 class BioBankApp(QMainWindow):
     def __init__(self):
