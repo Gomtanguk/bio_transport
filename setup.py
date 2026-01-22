@@ -31,6 +31,7 @@ setup(
         'bio_main = babo.main_integrated:main',      # 메인 오케스트레이터
         'bio_sub = babo.rack_transport_action:main',  # 하위 로봇 제어
         'bio_ui = babo.ui_integrated:main',
+        'basic_bio_action_server = babo.basic_bio_action_server:main',
         ],
     },
 )

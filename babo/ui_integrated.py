@@ -1,10 +1,11 @@
-# ui_integrated v2.102 2026-01-21
+# ui_integrated v2.201 2026-01-22
 # [이번 버전에서 수정된 사항]
-# - ui_integrated.py의 ROS2 Action 연동 기능을 이식 (bio_main_control -> main_integrated)
-# - 렉 탭(입고/출고/이동) 확인 버튼이 ros2 run 대신 Action 전송으로 동작
-# - 로봇 작업 결과(success/fail)에 따라 로그 출력 및 성공 시 재고 상태 반영
-# - (버그수정) console_scripts 엔트리포인트를 위한 main() 함수 추가
-# - (버그수정) Qt 실행 argv에서 ROS 인자 제거(remove_ros_args) 적용
+# - (기능추가) 튜브 탭 작업도 TubeTransport Action(tube_main_control)로 main_integrated에 전송 및 피드백/결과 표시
+# - (기능추가) 튜브 슬롯 ID(A-1-1~B-2-4) 파싱 후 IN/OUT/MOVE 모드에 따라 pick/place posx 자동 산출
+# - (기능추가) A-1과 A-2, B-1과 B-2는 동일 작업좌표로 처리(중간 번호 무시)
+# - (유지) QoS는 코드 설정값(ACTION_QOS: RELIABLE/VOLATILE/KEEP_LAST depth=5) 그대로 사용
+# - (유지) 렉 탭(RACK)은 기존 BioCommand 액션 흐름 유지
+# - (버그수정) 렉 탭 확인 버튼 콜백(on_confirm_t2) 누락으로 인한 AttributeError 수정
 
 """[모듈] ui_integrated
 
@@ -15,9 +16,10 @@
 [연동 흐름]
 UI(ui_integrated) --(BioCommand: bio_main_control)--> main_integrated --(RobotMove: /robot_action)--> rack_transport_action
 """
-
+import math
 import sys
 import os
+import re
 import subprocess
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -39,13 +41,138 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 # =========================
 ACTION_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    durability=DurabilityPolicy.VOLATILE,
     history=HistoryPolicy.KEEP_LAST,
     depth=5,
 )
 
+# =========================
+# DEFAULT_ 상수(튜브 posx 설정)
+# =========================
+# - 작업공간 규칙:
+#   - A-1-* == A-2-* (중간 번호 무시)
+#   - B-1-* == B-2-* (중간 번호 무시)
+#   - 마지막 번호 i(1~4)가 슬롯 인덱스
+
+ORIGIN_POINT = [367.320, 6.580, 422.710, 103.18, 179.970, 103.140]
+
+A_OUT_1 = [300.110, -24.860, 421.120, 120.220, -179.780, 120.220]
+A_OUT_2 = [300.980, 13.850, 420.480, 156.150, -179.770, 155.930]
+A_OUT_3 = [302.630, 51.610, 419.080, 9.890, 179.710, 9.690]
+A_OUT_4 = [301.870, 87.680, 418.390, 20.960, 179.690, 20.630]
+
+B_OUT_1 = [299.760, -30.520, 416.240, 159.740, -179.660, 159.870]
+B_OUT_2 = [301.220, 3.920, 417.980, 2.790, 179.420, 3.060]
+B_OUT_3 = [299.420, 40.170, 418.310, 18.420, 179.130, 18.740]
+B_OUT_4 = [300.030, 80.630, 417.880, 16.660, 179.080, 17.210]
+
+OUT_1 = [627.110, -154.340, 414.820, 116.420, 180.000, 116.050]
+OUT_2 = [632.190, -116.610, 411.860, 169.150, 179.670, 168.460]
+OUT_3 = [634.420, -75.460, 411.880, 173.080, 179.620, 172.650]
+OUT_4 = [634.450, -39.530, 403.940, 165.870, -179.970, 165.840]
+
+A_IN_1 = [300.000, -24.860, 540.000, 120.000, 180.000, 120.000]
+A_IN_2 = [300.000, 13.850, 540.000, 156.000, 180.000, 156.000]
+A_IN_3 = [300.000, 51.610, 540.000, 10.000, 180.000, 10.000]
+A_IN_4 = [300.000, 87.680, 540.000, 21.000, 180.000, 21.000]
+
+B_IN_1 = [300.000, -30.520, 540.000, 160.000, 180.000, 160.000]
+B_IN_2 = [300.000, 3.920, 540, 3.000, 180.000, 3.000]
+B_IN_3 = [300.000, 40.170, 540.000, 18.000, 180.000, 18.000]
+B_IN_4 = [300.000, 80.630, 540.000, 17.000, 180.000, 17.000]
+
+IN_1 = [624.180, -154.700, 359.040, 2.330, 178.990, 2.900]
+IN_2 = [626.520, -116.780, 358.430, 5.680, 179.090, 6.080]
+IN_3 = [628.100, -81.450, 355.870, 12.000, 179.230, 12.200]
+IN_4 = [629.050, -42.820, 351.110, 18.240, 179.320, 18.480]
+
+RACK_OUT_POINTS = {
+    "A": {1: A_OUT_1, 2: A_OUT_2, 3: A_OUT_3, 4: A_OUT_4},
+    "B": {1: B_OUT_1, 2: B_OUT_2, 3: B_OUT_3, 4: B_OUT_4},
+}
+RACK_IN_POINTS = {
+    "A": {1: A_IN_1, 2: A_IN_2, 3: A_IN_3, 4: A_IN_4},
+    "B": {1: B_IN_1, 2: B_IN_2, 3: B_IN_3, 4: B_IN_4},
+}
+OUT_POINTS = {1: OUT_1, 2: OUT_2, 3: OUT_3, 4: OUT_4}
+IN_POINTS = {1: IN_1, 2: IN_2, 3: IN_3, 4: IN_4}
+
+# 폐기 위치는 아직 미정이면 None 유지(필요 시 티칭값으로 교체)
+DEFAULT_TUBE_WASTE_PLACE_POSX = None
+
+def _normalize_tube_slot_id(raw: str) -> str:
+    s = str(raw).strip().upper()
+    s = s.replace("_", "-")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+def parse_tube_slot_id(raw: str) -> tuple[str, int]:
+    """
+    예) 'A-2-2' -> ('A', 2)
+        'A_1_2' -> ('A', 2)
+        'B-1-4' -> ('B', 4)
+    """
+    s = _normalize_tube_slot_id(raw)
+    m = re.match(r"^([AB])\-([12])\-([1-4])$", s)
+    if not m:
+        raise ValueError(f"Invalid tube slot id: {raw}")
+    group = m.group(1)
+    i = int(m.group(3))
+    return group, i
+
+def parse_command(cmd: str):
+    cmd = cmd.replace("|", ",")
+    parts = [p.strip().upper() for p in cmd.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid command format (need 4 parts): {parts}")
+
+    cmd_type, mode, src, dst = parts
+    if cmd_type != "TUBE":
+        raise ValueError(f"cmd_type must be TUBE, got: {cmd_type}")
+
+    src = None if src == "NONE" else src
+    dst = None if dst == "NONE" else dst
+
+    pick_pose, place_pose = resolve_tube_pick_place(mode, src, dst)
+    return cmd_type, pick_pose, place_pose
+
+def resolve_tube_pick_place(mode: str, src: str | None, dst: str | None) -> tuple[list[float], list[float]]:
+    """
+    mode:
+      - 'IN'  : pick=IN_i,               place=RACK_IN[group][i] (dst 기준)
+      - 'OUT' : pick=RACK_OUT[group][i], place=OUT_i (src 기준)
+      - 'MOVE': pick=RACK_OUT[src],    place=RACK_IN[dst]
+      - 'WASTE': pick=RACK_OUT[src],   place=DEFAULT_TUBE_WASTE_PLACE_POSX
+    """
+    mode_u = (mode or "").strip().upper()
+    if mode_u == "IN":
+        if not dst:
+            raise ValueError("IN mode requires dst")
+        g, i = parse_tube_slot_id(dst)
+        return list(IN_POINTS[i]), list(RACK_IN_POINTS[g][i])
+    if mode_u == "OUT":
+        if not src:
+            raise ValueError("OUT mode requires src")
+        g, i = parse_tube_slot_id(src)
+        return list(RACK_OUT_POINTS[g][i]), list(OUT_POINTS[i])
+    if mode_u == "MOVE":
+        if not src or not dst:
+            raise ValueError("MOVE mode requires src and dst")
+        gs, isrc = parse_tube_slot_id(src)
+        gd, idst = parse_tube_slot_id(dst)
+        return list(RACK_OUT_POINTS[gs][isrc]), list(RACK_IN_POINTS[gd][idst])
+    if mode_u == "WASTE":
+        if not src:
+            raise ValueError("WASTE mode requires src")
+        if DEFAULT_TUBE_WASTE_PLACE_POSX is None:
+            raise ValueError("DEFAULT_TUBE_WASTE_PLACE_POSX is None")
+        gs, isrc = parse_tube_slot_id(src)
+        return list(RACK_OUT_POINTS[gs][isrc]), list(DEFAULT_TUBE_WASTE_PLACE_POSX)
+    raise ValueError(f"Unknown mode: {mode}")
+
+
 try:
-    from biobank_interfaces.action import BioCommand
+    from biobank_interfaces.action import BioCommand, TubeTransport
 except ImportError:
     # Dummy for environment check
     class BioCommand:
@@ -57,6 +184,20 @@ except ImportError:
         class Feedback:
             status = ""
 
+
+    class TubeTransport:
+        class Goal:
+            job_id = ""
+            pick_posx = [0.0]*6
+            place_posx = [0.0]*6
+        class Result:
+            success = True
+            error_code = ""
+            message = ""
+        class Feedback:
+            stage = ""
+            progress = 0.0
+            detail = ""
 
 # ========================================================
 # [스타일시트] 확인 버튼 글씨 가시성 해결 + 빨간색 스타일 유지
@@ -174,13 +315,22 @@ class UiActionClientNode(Node):
         self.qos = ACTION_QOS
         self.qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
 
         self.client = ActionClient(
             self, BioCommand, "bio_main_control",
+            goal_service_qos_profile=self.qos,
+            result_service_qos_profile=self.qos,
+            cancel_service_qos_profile=self.qos,
+            feedback_sub_qos_profile=self.qos,
+            status_sub_qos_profile=self.qos,
+        )
+
+        self.tube_client = ActionClient(
+            self, TubeTransport, "tube_main_control",
             goal_service_qos_profile=self.qos,
             result_service_qos_profile=self.qos,
             cancel_service_qos_profile=self.qos,
@@ -249,6 +399,132 @@ class UiActionClientNode(Node):
 
         self.ui.on_rack_action_result(success, msg)
 
+    @staticmethod
+    def _posx6(p, name="posx"):
+        seq = list(p)
+        if len(seq) != 6:
+            raise ValueError(f"{name} len!=6: {seq}")
+        out = []
+        for i, v in enumerate(seq):
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"{name}[{i}] not finite: {v}")
+            out.append(fv)
+        return out
+        
+    def send_tube_transport(self, job_id: str, pick_posx6, place_posx6) -> bool:
+        if not self.tube_client.wait_for_server(timeout_sec=1.0):
+            self.ui.log_t1("❌ [Action] tube_main_control 서버 연결 실패")
+            return False
+
+        goal = TubeTransport.Goal()
+        goal.job_id = str(job_id)
+
+        try:
+            pick_posx6  = self._posx6(pick_posx6,  "pick_posx")
+            place_posx6 = self._posx6(place_posx6, "place_posx")
+        except Exception as e:
+            self.ui.log_t1(f"❌ [Tube] 좌표 변환 실패: {e}")
+            self.ui.log_t1(f"   raw place={place_posx6!r}")
+            return False
+
+        try:
+            goal.pick_posx  = self._posx6(pick_posx6,  "pick_posx")
+            goal.place_posx = self._posx6(place_posx6, "place_posx")
+        except AssertionError as e:
+            self.ui.log_t1(f"❌ [Tube] 메시지 대입 Assertion: {e}")
+            self.ui.log_t1(f"   conv place={place_posx6} (types={[type(x).__name__ for x in place_posx6]})")
+            return False
+
+        send_future = self.tube_client.send_goal_async(goal, feedback_callback=self._on_tube_feedback)
+        send_future.add_done_callback(self._on_tube_goal_response)
+        return True
+        
+
+    def _handle_tube_send(self, mode: str, src_slot: str, dst_slot: str, job_id: str) -> bool:
+        cmd = None
+        mode_u = str(mode).strip().upper()
+
+        if mode_u == "IN":
+            cmd = f"TUBE,IN,NONE,{dst_slot}"
+        elif mode_u == "OUT":
+            cmd = f"TUBE,OUT,{src_slot},NONE"
+        elif mode_u == "MOVE":
+            cmd = f"TUBE,MOVE,{src_slot},{dst_slot}"
+        else:
+            self.ui.log_t1(f"❌ [posx/parse] Unknown mode: {mode}")
+            return False
+
+        try:
+            _, pick_pose, place_pose = parse_command(cmd)
+        except Exception as e:
+            self.ui.log_t1(f"❌ [posx/parse] {e} / cmd={cmd}")
+            return False
+
+        return self.send_tube_transport(job_id, pick_pose, place_pose)
+
+        goal = TubeTransport.Goal()
+        goal.job_id = str(job_id)
+
+        try:
+            goal.pick_posx  = self._posx6(pick_posx6)
+            goal.place_posx = self._posx6(place_posx6)
+        except ValueError as e:
+            self.ui.log_t1(f"❌ [Tube] 좌표 오류: {e}")
+            return False
+        
+        goal.pick_posx = list(pick_posx6)
+        goal.place_posx = list(place_posx6)
+
+        self.ui.log_t1(f"📤 [Action] 전송(job_id): {job_id}")
+        send_future = self.tube_client.send_goal_async(
+            goal, feedback_callback=self._on_tube_feedback
+        )
+        send_future.add_done_callback(self._on_tube_goal_response)
+        return True
+
+
+
+    def _on_tube_feedback(self, feedback_msg):
+        try:
+            fb = feedback_msg.feedback
+            stage = getattr(fb, 'stage', '')
+            prog = getattr(fb, 'progress', 0.0)
+            detail = getattr(fb, 'detail', '')
+            if stage or detail:
+                self.ui.log_t1(f"🟡 [Feedback] {stage} ({prog:.2f}) {detail}")
+        except Exception:
+            pass
+
+    def _on_tube_goal_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.ui.log_t1(f"❌ [Action] Goal 응답 예외: {e}")
+            self.ui.on_tube_action_result(False, "GOAL_EXCEPTION", f"Goal exception: {e}")
+            return
+
+        if not goal_handle.accepted:
+            self.ui.log_t1("❌ [Action] Goal 거절됨")
+            self.ui.on_tube_action_result(False, "GOAL_REJECTED", "Goal rejected")
+            return
+
+        self.ui.log_t1("✅ [Action] Goal 수락")
+        res_future = goal_handle.get_result_async()
+        res_future.add_done_callback(self._on_tube_result)
+
+    def _on_tube_result(self, future):
+        try:
+            res = future.result().result
+            success = bool(getattr(res, 'success', False))
+            err = str(getattr(res, 'error_code', ''))
+            msg = str(getattr(res, 'message', ''))
+        except Exception as e:
+            success = False
+            err = "RESULT_EXCEPTION"
+            msg = f"Result exception: {e}"
+
+        self.ui.on_tube_action_result(success, err, msg)
 
 class BioBankApp(QMainWindow):
     def __init__(self):
@@ -299,6 +575,10 @@ class BioBankApp(QMainWindow):
         # Action 기반 연동용 노드(외부에서 주입)
         self.ros_node = None
         self._pending_rack_change = None  # (mode, sel_list, dest_list)
+        self._pending_tube_change = None  # (mode, sel_list, dest_list)
+        self._tube_job_queue = []
+        self._tube_job_running = False
+
 
     # ==========================================================
     # ROS2 Action 연동
@@ -321,6 +601,36 @@ class BioBankApp(QMainWindow):
     # ==========================================================
     # Helper 상태 확인 및 UI 갱신
     # ==========================================================
+
+    def _start_next_tube_job(self):
+        if getattr(self, '_tube_job_running', False):
+            return
+        if not getattr(self, '_tube_job_queue', None):
+            self.log_t1("✅ [Tube] 모든 작업 완료")
+            return
+        mode_id, sel_list, dest_list, job_id, pick_posx6, place_posx6 = self._tube_job_queue.pop(0)
+        self._tube_job_running = True
+        self._pending_tube_change = (mode_id, sel_list, dest_list)
+        self.log_t1(f"📤 [Tube] 전송: {job_id}")
+        ok = self.ros_node.send_tube_transport(job_id, pick_posx6, place_posx6)
+        if not ok:
+            self._tube_job_running = False
+            self.log_t1("❌ [Tube] tube_main_control 서버 연결 실패")
+
+    def on_tube_action_result(self, success: bool, error_code: str, message: str):
+        """tube 작업 Action 결과를 UI에 반영 + 큐 다음 작업 진행"""
+        if success:
+            self.log_t1(f"✅ [Result] 성공: {message}")
+            if getattr(self, '_pending_tube_change', None) is not None:
+                mode, sel_list, dest_list = self._pending_tube_change
+                self.process_inventory_change(mode, sel_list, dest_list)
+        else:
+            self.log_t1(f"❌ [Result] 실패({error_code}): {message}")
+
+        self._pending_tube_change = None
+        self._tube_job_running = False
+        self._start_next_tube_job()
+
     def is_item_blocked(self, item_id):
         for bad in self.blocked_specific:
             if bad in item_id: return True
@@ -389,6 +699,13 @@ class BioBankApp(QMainWindow):
         self.le_t2_dest.setText(", ".join(sorted(list(self.t2_dest_items))))
 
     def on_tube_clicked(self, checked, tube_id, btn_obj):
+        """튜브 버튼 클릭 처리
+
+        tube_id: 'A-1-1' ~ 'B-2-4' 형태
+        - 입고(1): 목적지(dest) 선택
+        - 출고(2)/폐기(4): 대상(sel) 선택
+        - 이동(3): sel -> dest 순서로 2개 선택
+        """
         # [차단 체크] 차단된 아이템은 선택 불가
         if self.is_item_blocked(tube_id):
             btn_obj.setChecked(False)
@@ -396,26 +713,38 @@ class BioBankApp(QMainWindow):
             return
 
         mode_id = self.t1_mode_group.checkedId()
-        if mode_id == 3: # 이동
+
+        # 이동 모드: sel/dest 2개만 처리(텍스트필드 기반)
+        if mode_id == 3:
             if not checked:
-                if self.le_t1_selected.text() == tube_id: self.le_t1_selected.clear()
-                elif self.le_t1_dest.text() == tube_id: self.le_t1_dest.clear()
-                if btn_obj in self.t1_active_buttons: self.t1_active_buttons.remove(btn_obj)
+                if self.le_t1_selected.text() == tube_id:
+                    self.le_t1_selected.clear()
+                elif self.le_t1_dest.text() == tube_id:
+                    self.le_t1_dest.clear()
+                if btn_obj in self.t1_active_buttons:
+                    self.t1_active_buttons.remove(btn_obj)
             else:
                 self.t1_active_buttons.add(btn_obj)
-                if not self.le_t1_selected.text(): self.le_t1_selected.setText(tube_id)
-                else: self.le_t1_dest.setText(tube_id)
+                if not self.le_t1_selected.text():
+                    self.le_t1_selected.setText(tube_id)
+                elif not self.le_t1_dest.text():
+                    self.le_t1_dest.setText(tube_id)
+                else:
+                    # 이미 2개 채워졌으면 새 클릭은 무시
+                    btn_obj.setChecked(False)
+                    self.t1_active_buttons.discard(btn_obj)
+                    self.log_t1("⚠️ [안내] 이동은 2개(sel/dest)만 선택 가능합니다.")
             return
 
+        # 입고는 dest, 출고/폐기는 sel
         target_set = self.t1_dest_items if mode_id == 1 else self.t1_selected_items
-        if mode_id == 4: self.le_t1_dest.setText("폐기장 (Disposal)")
-
-        if checked: target_set.add(tube_id); self.t1_active_buttons.add(btn_obj)
+        if checked:
+            target_set.add(tube_id)
+            self.t1_active_buttons.add(btn_obj)
         else:
-            if tube_id in target_set: target_set.remove(tube_id)
-            if btn_obj in self.t1_active_buttons: self.t1_active_buttons.remove(btn_obj)
+            target_set.discard(tube_id)
+            self.t1_active_buttons.discard(btn_obj)
         self.update_text_fields_t1()
-
     def on_rack_clicked(self, checked, rack_id, btn_obj):
         if self.is_item_blocked(rack_id):
             btn_obj.setChecked(False)
@@ -445,119 +774,160 @@ class BioBankApp(QMainWindow):
     # 확인 버튼 -> 로그 상세화
     # ==========================================================
     def on_confirm_t1(self):
-        mode = self.t1_mode_group.checkedId()
+        """튜브 탭 확인 버튼
+
+        - UI에서 선택된 슬롯 ID를 파싱하여 pick/place posx를 계산한 뒤,
+          TubeTransport Action(tube_main_control)로 main_integrated에 전송한다.
+        """
+        mode_id = self.t1_mode_group.checkedId()
         sel_list = list(self.t1_selected_items)
         dest_list = list(self.t1_dest_items)
-        
-        # [데이터 검증]
-        if mode == 3:
-            s_txt = self.le_t1_selected.text()
-            d_txt = self.le_t1_dest.text()
-            if not s_txt or not d_txt: self.log_t1("[경고] 이동: 대상/목적지 필요"); return
-            sel_list = [s_txt]
-            dest_list = [d_txt]
-        else:
-            if mode == 1 and not dest_list: self.log_t1("[경고] 입고: 목적지 필요"); return
-            if (mode == 2 or mode == 4) and not sel_list: self.log_t1("[경고] 출고/폐기: 대상 필요"); return
 
-        # [로그 메시지 작성]
-        action_name = {1:"입고", 2:"출고", 3:"이동", 4:"폐기"}[mode]
-        log_msg = f"✅ [{action_name}] "
-        
-        # 상세 내역 추가
-        if mode == 1: # 입고: 바코드 -> 목적지들
-            input_bc = self.le_t1_input.text() if self.le_t1_input.text() else "Unknown"
-            dest_str = ", ".join(sorted(dest_list))
-            log_msg += f"바코드({input_bc}) ➡️ {dest_str}"
-        elif mode == 2: # 출고: 선택들 -> 반출
-            sel_str = ", ".join(sorted(sel_list))
-            log_msg += f"{sel_str} ➡️ 반출"
-        elif mode == 3: # 이동: A -> B
-            log_msg += f"{sel_list[0]} ➡️ {dest_list[0]}"
-        elif mode == 4: # 폐기: 선택들 -> 폐기장
-            sel_str = ", ".join(sorted(sel_list))
-            log_msg += f"{sel_str} ➡️ 폐기장"
-        
-        # 로그 출력
-        self.log_t1(log_msg)
-        
-        # 재고 반영 및 초기화 (로그는 유지)
-        self.process_inventory_change(mode, sel_list, dest_list)
-        
-        # 입력값만 초기화
-        for btn in self.t1_active_buttons: btn.setChecked(False)
-        self.t1_active_buttons.clear(); self.t1_selected_items.clear(); self.t1_dest_items.clear()
-        self.le_t1_selected.clear(); self.le_t1_dest.clear(); self.le_t1_input.clear()
+        # --- 확정 sel/dest 만들기 ---
+        if mode_id == 3:
+            src = self.le_t1_selected.text().strip()
+            dst = self.le_t1_dest.text().strip()
+            if not src or not dst:
+                self.log_t1("[경고] 이동: 대상/목적지 필요")
+                return
+            sel_list = [src]
+            dest_list = [dst]
+        else:
+            if mode_id == 1 and not dest_list:
+                self.log_t1("[경고] 입고: 목적지 필요")
+                return
+            if (mode_id == 2 or mode_id == 4) and not sel_list:
+                self.log_t1("[경고] 출고/폐기: 대상 필요")
+                return
+
+        # --- TubeTransport job 생성 ---
+        jobs = []  # (mode_id, sel_list, dest_list, job_id, pick_posx6, place_posx6)
+        barcode = self.le_t1_input.text().strip()
+
+        try:
+            if mode_id == 1:  # 입고
+                for dst in sorted(dest_list):
+                    pick, place = resolve_tube_pick_place("IN", None, dst)
+                    job_id = f"{barcode or 'IN'}|IN|{dst}"
+                    jobs.append((1, [], [dst], job_id, pick, place))
+
+            elif mode_id == 2:  # 출고
+                for src in sorted(sel_list):
+                    pick, place = resolve_tube_pick_place("OUT", src, None)
+                    job_id = f"{barcode or 'OUT'}|OUT|{src}"
+                    jobs.append((2, [src], [], job_id, pick, place))
+
+            elif mode_id == 3:  # 이동(랙->랙)
+                src = sel_list[0]
+                dst = dest_list[0]
+                pick, place = resolve_tube_pick_place("MOVE", src, dst)
+                job_id = f"{barcode or 'MOVE'}|MOVE|{src}->{dst}"
+                jobs.append((3, [src], [dst], job_id, pick, place))
+
+            elif mode_id == 4:  # 폐기
+                for src in sorted(sel_list):
+                    pick, place = resolve_tube_pick_place("WASTE", src, None)
+                    job_id = f"{barcode or 'WASTE'}|WASTE|{src}"
+                    jobs.append((4, [src], [], job_id, pick, place))
+
+            else:
+                self.log_t1("[경고] 알 수 없는 모드")
+                return
+        except Exception as e:
+            self.log_t1(f"❌ [posx/parse] {e}")
+            return
+
+        if not jobs:
+            self.log_t1("[경고] 실행할 작업이 없습니다.")
+            return
+
+        # 큐로 순차 실행
+        self._tube_job_queue = jobs
+        self._tube_job_running = False
+
+        # 입력/선택 UI는 즉시 초기화(기존 UX 유지)
+        for btn in list(self.t1_active_buttons):
+            try:
+                btn.setChecked(False)
+            except Exception:
+                pass
+        self.t1_active_buttons.clear()
+        self.t1_selected_items.clear()
+        self.t1_dest_items.clear()
+        self.le_t1_selected.clear()
+        self.le_t1_dest.clear()
+        self.le_t1_input.clear()
+
+        self._start_next_tube_job()
 
     def on_confirm_t2(self):
-        mode = self.t2_mode_group.checkedId()
+        """렉 탭 확인 버튼
+
+        - 선택된 렉/목적지를 기반으로 BioCommand(Action: bio_main_control)를 전송한다.
+        - 실제 재고 반영은 Action 결과 성공 시(on_rack_action_result) 수행한다.
+        """
+        mode_id = self.t2_mode_group.checkedId()
         sel_list = list(self.t2_selected_items)
         dest_list = list(self.t2_dest_items)
 
         # --- 확정 sel/dest 만들기 ---
-        if mode == 3:
-            sel = self.le_t2_selected.text().strip()
-            dest = self.le_t2_dest.text().strip()
-            if not sel or not dest:
-                self.log_t2("[경고] 이동: 대상/목적지 필요")
+        if mode_id == 3:
+            src = self.le_t2_selected.text().strip()
+            dst = self.le_t2_dest.text().strip()
+            if not src or not dst:
+                self.log_t2('[경고] 이동: 대상/목적지 필요')
                 return
-            sel_list = [sel]
-            dest_list = [dest]
+            sel_list = [src]
+            dest_list = [dst]
         else:
-            if mode == 1 and not dest_list:
-                self.log_t2("[경고] 입고: 목적지 필요")
+            if mode_id == 1 and not dest_list:
+                self.log_t2('[경고] 입고: 목적지 필요')
                 return
-            if mode == 2 and not sel_list:
-                self.log_t2("[경고] 출고: 대상 필요")
+            if mode_id == 2 and not sel_list:
+                self.log_t2('[경고] 출고: 대상 필요')
                 return
 
-        action_name = {1:"렉 입고", 2:"렉 출고", 3:"렉 이동"}[mode]
-        log_msg = f"✅ [{action_name}] "
+        action_name = {1: '렉 입고', 2: '렉 출고', 3: '렉 이동'}[mode_id]
+        log_msg = f'✅ [{action_name}] '
 
         # UI 로그(기존 형식 유지)
-        if mode == 1:
-            input_bc = self.le_t2_input.text().strip() if self.le_t2_input.text().strip() else "Unknown"
-            dest_str = ", ".join(sorted(dest_list))
-            log_msg += f"바코드({input_bc}) ➡️ {dest_str}"
-        elif mode == 2:
-            sel_str = ", ".join(sorted(sel_list))
-            log_msg += f"{sel_str} ➡️ 반출"
-        elif mode == 3:
-            log_msg += f"{sel_list[0]} ➡️ {dest_list[0]}"
+        if mode_id == 1:
+            input_bc = self.le_t2_input.text().strip() if self.le_t2_input.text().strip() else 'Unknown'
+            dest_str = ', '.join(sorted(dest_list))
+            log_msg += f'바코드({input_bc}) ➡️ {dest_str}'
+        elif mode_id == 2:
+            sel_str = ', '.join(sorted(sel_list))
+            log_msg += f'{sel_str} ➡️ 반출'
+        elif mode_id == 3:
+            log_msg += f'{sel_list[0]} ➡️ {dest_list[0]}'
         self.log_t2(log_msg)
 
         # ------------------------------------------------------
         # UI -> main_integrated(Action) -> rack_transport_action
         # ------------------------------------------------------
         if self.ros_node is None:
-            self.log_t2("❌ [Action] ROS 노드 미연동 (UI 실행 시 rclpy/init 필요)")
+            self.log_t2('❌ [Action] ROS 노드 미연동 (UI 실행 시 rclpy/init 필요)')
             return
 
         # 다중 선택은 현재 Action 포맷상 1개만 지원 (첫 항목만 전송)
-        if mode == 1:
+        if mode_id == 1:
             if len(dest_list) > 1:
-                self.log_t2("⚠️ [안내] 렉 입고 목적지는 1개만 지원: 첫 항목만 전송")
-            dest = sorted(dest_list)[0]
-            ok = self.ros_node.send_rack_command("IN", "NONE", dest)
-        elif mode == 2:
+                self.log_t2('⚠️ [안내] 렉 입고 목적지는 1개만 지원: 첫 항목만 전송')
+            dst = sorted(dest_list)[0]
+            ok = self.ros_node.send_rack_command('IN', 'NONE', dst)
+        elif mode_id == 2:
             if len(sel_list) > 1:
-                self.log_t2("⚠️ [안내] 렉 출고 대상은 1개만 지원: 첫 항목만 전송")
+                self.log_t2('⚠️ [안내] 렉 출고 대상은 1개만 지원: 첫 항목만 전송')
             src = sorted(sel_list)[0]
-            ok = self.ros_node.send_rack_command("OUT", src, "NONE")
+            ok = self.ros_node.send_rack_command('OUT', src, 'NONE')
         else:
-            ok = self.ros_node.send_rack_command("MOVE", sel_list[0], dest_list[0])
+            ok = self.ros_node.send_rack_command('MOVE', sel_list[0], dest_list[0])
 
         if not ok:
             return
 
         # 성공 시에만 재고 반영(결과 콜백에서 처리)
-        self._pending_rack_change = (mode, sel_list, dest_list)
-
-        # 입력/선택 UI는 즉시 초기화(기존 UX 유지)
-        for btn in self.t2_active_buttons:
-            btn.setChecked(False)
-        self.t2_active_buttons.clear(); self.t2_selected_items.clear(); self.t2_dest_items.clear()
-        self.le_t2_selected.clear(); self.le_t2_dest.clear(); self.le_t2_input.clear()
+        self._pending_rack_change = (mode_id, sel_list, dest_list)
 
     def log_t1(self, msg): self.txt_log_t1.append(msg)
     def log_t2(self, msg): self.txt_log_t2.append(msg)

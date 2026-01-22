@@ -1,26 +1,19 @@
-# main_integrated v2.100 2026-01-21
+# main_integrated v2.200 2026-01-22
 # [이번 버전에서 수정된 사항]
-# - (기능변경) bio_main_control(BioCommand) 목표 수신 시 즉시 수신 로그(goal_callback) 출력 추가
-# - (기능변경) 로봇 실행은 asyncio.Lock으로 직렬화(1대 로봇 보호)하되, 목표 수신/대기열 피드백은 즉시 처리
-# - (구조정리) QoS를 RELIABLE + TRANSIENT_LOCAL + KEEP_LAST(depth=5)로 단일 상수(ACTION_QOS)로 고정
-# - (안정화) MultiThreadedExecutor(num_threads=4)로 명령 수신/피드백/하위 Action 대기 중에도 콜백 처리 유지
+# - (기능추가) TubeTransport Action(tube_main_control)을 수신해 로봇(/tube_transport)으로 중계 + 피드백(stage/progress/detail) 전달
+# - (기능변경) Rack(BioCommand)과 Tube(TubeTransport)를 동일 asyncio.Lock으로 직렬화(1대 로봇 보호)
+# - (유지) QoS는 코드 설정값(ACTION_QOS: RELIABLE/VOLATILE/KEEP_LAST depth=5) 그대로 사용
 
 """[모듈] main_integrated
 
 [역할]
-- UI(Action: BioCommand, /bio_main_control)로부터 Rack 명령을 받아,
+- UI(Action: BioCommand, bio_main_control)로부터 Rack 명령을 받아,
   하위 로봇 Action(RobotMove, /robot_action)으로 전달하고 결과를 UI에 반환한다.
-
-[핵심 포인트]
-- 로봇은 동시에 2개 작업을 실행하면 위험하므로, asyncio.Lock으로 실행을 직렬화한다.
-- 다만 "명령 수신" 로그가 실행 시작 시점에만 찍히면 사용자는 '한번만 받는다'고 느끼므로,
-  goal_callback에서 즉시 수신 로그를 남기고, execute 콜백에서는 대기열 피드백을 제공한다.
-
-[명령 예]
-- UI -> main_integrated: "RACK,IN,NONE,A-2"
-- main_integrated -> robot_action: "IN,NONE,A-2"
+- UI(Action: TubeTransport, tube_main_control)로부터 Tube 이동 명령을 받아,
+  하위 로봇 Action(TubeTransport, /tube_transport)으로 전달하고 결과/피드백을 UI에 중계한다.
 """
 
+from __future__ import annotations
 
 import asyncio
 
@@ -31,11 +24,9 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-# 인터페이스 정의
 try:
-    from biobank_interfaces.action import BioCommand, RobotMove
+    from biobank_interfaces.action import BioCommand, RobotMove, TubeTransport
 except ImportError:
-    # Dummy for check
     class BioCommand:  # pragma: no cover
         class Goal: command = ""
         class Result:
@@ -54,11 +45,24 @@ except ImportError:
         class Feedback:
             status = ""
 
+    class TubeTransport:  # pragma: no cover
+        class Goal:
+            job_id = ""
+            pick_posx = [0.0] * 6
+            place_posx = [0.0] * 6
+        class Result:
+            success = True
+            error_code = ""
+            message = ""
+        class Feedback:
+            stage = ""
+            progress = 0.0
+            detail = ""
 
-# ✅ [QoS] Reliable + Transient Local + Keep Last
+
 ACTION_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    durability=DurabilityPolicy.VOLATILE,
     history=HistoryPolicy.KEEP_LAST,
     depth=5,
 )
@@ -67,21 +71,18 @@ ACTION_QOS = QoSProfile(
 class MainIntegrated(Node):
     def __init__(self):
         super().__init__("main_orchestrator")
-
         self.callback_group = ReentrantCallbackGroup()
-
-        # 로봇 실행 직렬화(1대 로봇 보호)
         self._robot_lock = asyncio.Lock()
 
-        # 1) [Server] UI로부터 명령 수신
-        self._ui_server = ActionServer(
+        # Rack server
+        self._rack_server = ActionServer(
             self,
             BioCommand,
             "bio_main_control",
-            execute_callback=self.handle_ui_command,
+            execute_callback=self.handle_rack_command,
             callback_group=self.callback_group,
-            goal_callback=self.goal_callback,
-            cancel_callback=self.cancel_callback,
+            goal_callback=self.rack_goal_callback,
+            cancel_callback=self.rack_cancel_callback,
             goal_service_qos_profile=ACTION_QOS,
             result_service_qos_profile=ACTION_QOS,
             cancel_service_qos_profile=ACTION_QOS,
@@ -89,7 +90,7 @@ class MainIntegrated(Node):
             status_pub_qos_profile=ACTION_QOS,
         )
 
-        # 2) [Client] 하위 로봇 액션으로 전달
+        # Rack client -> /robot_action
         self.robot_client = ActionClient(
             self,
             RobotMove,
@@ -102,75 +103,159 @@ class MainIntegrated(Node):
             status_sub_qos_profile=ACTION_QOS,
         )
 
-        self.get_logger().info("🧠 [Integrated] 통합 메인 노드 시작됨 (QoS Applied).")
+        # Tube server (UI -> main)
+        self._tube_server = ActionServer(
+            self,
+            TubeTransport,
+            "tube_main_control",
+            execute_callback=self.handle_tube_command,
+            callback_group=self.callback_group,
+            goal_callback=self.tube_goal_callback,
+            cancel_callback=self.tube_cancel_callback,
+            goal_service_qos_profile=ACTION_QOS,
+            result_service_qos_profile=ACTION_QOS,
+            cancel_service_qos_profile=ACTION_QOS,
+            feedback_pub_qos_profile=ACTION_QOS,
+            status_pub_qos_profile=ACTION_QOS,
+        )
 
-    # ==========================================================
-    # ActionServer callbacks
-    # ==========================================================
-    def goal_callback(self, goal_request: BioCommand.Goal):
-        # ⚠️ 이 로그는 '수신 즉시' 찍힘(사용자 체감 개선)
-        self.get_logger().info(f"📩 Goal 요청 수신: {getattr(goal_request, 'command', '')}")
+        # Tube client (main -> robot)
+        self.tube_client = ActionClient(
+            self,
+            TubeTransport,
+            "/tube_transport",
+            callback_group=self.callback_group,
+            goal_service_qos_profile=ACTION_QOS,
+            result_service_qos_profile=ACTION_QOS,
+            cancel_service_qos_profile=ACTION_QOS,
+            feedback_sub_qos_profile=ACTION_QOS,
+            status_sub_qos_profile=ACTION_QOS,
+        )
+
+        self.get_logger().info("🧠 [Integrated] main_integrated ready (Rack+Tube).")
+
+    # ---------------- Rack ----------------
+    def rack_goal_callback(self, goal_request: BioCommand.Goal):
+        self.get_logger().info(f"📩 [Rack] Goal: {getattr(goal_request, 'command', '')}")
         return GoalResponse.ACCEPT
 
-    def cancel_callback(self, goal_handle):
-        self.get_logger().warn("🛑 Cancel 요청 수신")
+    def rack_cancel_callback(self, goal_handle):
+        self.get_logger().warn("🛑 [Rack] Cancel")
         return CancelResponse.ACCEPT
 
-    async def handle_ui_command(self, goal_handle):
+    async def handle_rack_command(self, goal_handle):
         raw_cmd = goal_handle.request.command
-        self.get_logger().info(f"📥 명령 실행 시작: {raw_cmd}")
 
-        # prefix 제거: "RACK,..." -> "IN,NONE,A-2"
+        # "RACK,IN,NONE,A-2" -> "IN,NONE,A-2"
         try:
             parts = [p.strip() for p in str(raw_cmd).split(",")]
             sub_cmd = ",".join(parts[1:]) if len(parts) >= 2 else str(raw_cmd)
         except Exception:
             sub_cmd = str(raw_cmd)
 
-        # 로봇이 이미 실행 중이면, 즉시 '대기열' 피드백
         if self._robot_lock.locked():
             try:
                 goal_handle.publish_feedback(BioCommand.Feedback(status=f"대기열: 다른 작업 실행 중 ({sub_cmd})"))
             except Exception:
                 pass
 
-        # 실제 로봇 실행은 직렬화
         async with self._robot_lock:
             try:
                 goal_handle.publish_feedback(BioCommand.Feedback(status=f"실행 중: {sub_cmd}"))
             except Exception:
                 pass
-
             success, msg = await self.call_robot(sub_cmd)
 
-        if success:
-            goal_handle.succeed()
-        else:
-            goal_handle.abort()
-
+        goal_handle.succeed() if success else goal_handle.abort()
         return BioCommand.Result(success=success, message=msg)
 
-    # ==========================================================
-    # Robot Action client
-    # ==========================================================
     async def call_robot(self, cmd_str: str):
-        # wait_for_server는 blocking이지만 짧게만 사용(2s)
         if not self.robot_client.wait_for_server(timeout_sec=2.0):
             return False, "하위 로봇 Action(/robot_action) 서버 연결 실패"
 
         goal = RobotMove.Goal()
         goal.command = str(cmd_str)
 
-        goal_handle = await self.robot_client.send_goal_async(goal)
-        if not goal_handle.accepted:
+        gh = await self.robot_client.send_goal_async(goal)
+        if not gh.accepted:
             return False, "하위 로봇 Action Goal 거절됨"
 
-        result = await goal_handle.get_result_async()
-        return bool(result.result.success), str(result.result.message)
+        res = await gh.get_result_async()
+        return bool(res.result.success), str(res.result.message)
+
+    # ---------------- Tube ----------------
+    def tube_goal_callback(self, goal_request: TubeTransport.Goal):
+        self.get_logger().info(f"📩 [Tube] Goal: job_id={getattr(goal_request, 'job_id', '')}")
+        return GoalResponse.ACCEPT
+
+    def tube_cancel_callback(self, goal_handle):
+        self.get_logger().warn("🛑 [Tube] Cancel")
+        return CancelResponse.ACCEPT
+
+    async def handle_tube_command(self, goal_handle):
+        req = goal_handle.request
+
+        if self._robot_lock.locked():
+            try:
+                fb = TubeTransport.Feedback()
+                fb.stage = "QUEUED"
+                fb.progress = 0.0
+                fb.detail = "Waiting for other job"
+                goal_handle.publish_feedback(fb)
+            except Exception:
+                pass
+
+        async with self._robot_lock:
+            try:
+                fb = TubeTransport.Feedback()
+                fb.stage = "RUNNING"
+                fb.progress = 0.0
+                fb.detail = "Forwarding to /tube_transport"
+                goal_handle.publish_feedback(fb)
+            except Exception:
+                pass
+
+            success, err, msg = await self.call_tube(req, upstream_goal_handle=goal_handle)
+
+        out = TubeTransport.Result()
+        out.success = bool(success)
+        out.error_code = str(err)
+        out.message = str(msg)
+
+        goal_handle.succeed() if success else goal_handle.abort()
+        return out
+
+    async def call_tube(self, ui_goal: TubeTransport.Goal, upstream_goal_handle):
+        if not self.tube_client.wait_for_server(timeout_sec=2.0):
+            return False, "DOWNSTREAM_UNAVAILABLE", "하위 TubeTransport(/tube_transport) 서버 연결 실패"
+
+        goal = TubeTransport.Goal()
+        goal.job_id = str(getattr(ui_goal, "job_id", ""))
+        goal.pick_posx = list(getattr(ui_goal, "pick_posx", []))
+        goal.place_posx = list(getattr(ui_goal, "place_posx", []))
+
+        def _fb_cb(feedback_msg):
+            try:
+                fb_in = feedback_msg.feedback
+                fb_out = TubeTransport.Feedback()
+                fb_out.stage = str(getattr(fb_in, "stage", ""))
+                fb_out.progress = float(getattr(fb_in, "progress", 0.0))
+                fb_out.detail = str(getattr(fb_in, "detail", ""))
+                upstream_goal_handle.publish_feedback(fb_out)
+            except Exception:
+                pass
+
+        gh = await self.tube_client.send_goal_async(goal, feedback_callback=_fb_cb)
+        if not gh.accepted:
+            return False, "DOWNSTREAM_REJECTED", "하위 TubeTransport Goal 거절됨"
+
+        res = await gh.get_result_async()
+        r = res.result
+        return bool(getattr(r, "success", False)), str(getattr(r, "error_code", "")), str(getattr(r, "message", ""))
 
 
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = MainIntegrated()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
