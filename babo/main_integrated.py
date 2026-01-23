@@ -239,7 +239,7 @@ class MainIntegrated(Node):
         self._rack_server = ActionServer(
             self,
             BioCommand,
-            "bio_main_control",
+            "/bio_main_control",
             execute_callback=self.handle_rack_command,
             callback_group=self.callback_group,
             goal_callback=self.rack_goal_callback,
@@ -255,7 +255,7 @@ class MainIntegrated(Node):
         self.robot_client = ActionClient(
             self,
             RobotMove,
-            "robot_action",
+            "/robot_action",
             callback_group=self.callback_group,
             goal_service_qos_profile=ACTION_QOS,
             result_service_qos_profile=ACTION_QOS,
@@ -268,7 +268,7 @@ class MainIntegrated(Node):
         self._tube_server = ActionServer(
             self,
             BioCommand,
-            "tube_main_control",
+            "/tube_main_control",
             execute_callback=self.handle_ui_command,
             callback_group=self.callback_group,
             goal_callback=self.tube_goal_callback,
@@ -449,27 +449,22 @@ class MainIntegrated(Node):
 
                 # 3) 튜브 이송
                 ok_tube, err_code, tube_msg = await self.call_tube_transport(mode, pick_pose, place_pose, ui_goal_handle=goal_handle)
+                
                 if not ok_tube:
-                    # 실패여도 랙 복귀는 시도하는 정책(안전)
+                    # 튜브 이송 실패 시 로직
                     self.get_logger().error(f"튜브 이송 실패: {tube_msg} (error_code={err_code})")
-
-                    ok_ret, ret_msg = (True, "skip")
-                if return_cmd:
-                    ok_ret, ret_msg = await self.call_robot(return_cmd)
-                    if not ok_ret:
-                        msg = f"튜브 이송 실패({err_code}): {tube_msg} / 랙 복귀도 실패: {ret_msg}"
-                        self.get_logger().error(msg)
-                        goal_handle.abort()
-                        return BioCommand.Result(success=False, message=msg)
-
-                    msg = f"튜브 이송 실패({err_code}): {tube_msg} (랙은 복귀 완료)"
+                    if return_cmd:
+                        await self.call_robot(return_cmd) # 실패해도 안전을 위해 랙은 복귀
+                    
+                    msg = f"튜브 이송 실패({err_code}): {tube_msg}"
                     goal_handle.abort()
                     return BioCommand.Result(success=False, message=msg)
 
-                # 4) 랙 원위치
+                # 4) 랙 원위치 (성공 시 정상 복귀)
                 ok_ret, ret_msg = (True, "skip")
                 if return_cmd:
                     ok_ret, ret_msg = await self.call_robot(return_cmd)
+                
                 if not ok_ret:
                     msg = f"랙 원위치 실패: {ret_msg}"
                     self.get_logger().error(msg)

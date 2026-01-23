@@ -347,6 +347,15 @@ class BioBankApp(QMainWindow):
         self.blocked_prefix = ["C-", "D-"]
 
         self.inventory = set()
+        # [초기 재고 설정]
+        # 1. 튜브
+        initial_tubes = ["A-3-3", "A-3-1", "B-1-2", "B-1-1"]
+        for t in initial_tubes:
+            self.inventory.add(t)
+        # 2. 렉
+        initial_racks = ["A-3", "B-1"]
+        for r in initial_racks:
+            self.inventory.add(r)
         self.widget_map = {}
 
         self._pending_rack_change = None

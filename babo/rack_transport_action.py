@@ -63,13 +63,13 @@ DR_init.__dsr__model = ROBOT_MODEL
 # ==========================================================
 # 기본 모션 파라미터
 # ==========================================================
-VELOCITY = 60
+VELOCITY = 150
 ACC = 60
 
 
 
 # [Dispose(WASTE) 전용 파라미터]
-VELOCITY_DISPOSE = 100
+VELOCITY_DISPOSE = 150
 ACC_DISPOSE = 50
 DISPOSE_J5_ROTATE_DEG = -70.0
 DISPOSE_J2_ROTATE_DEG = 15.0
@@ -78,7 +78,7 @@ DISPOSE_OPEN_WAIT_SEC = 1.0
 DEFAULT_PICK_PRE_TOOL_MM = 18.0   # 잡기 전 Tool Z축 상승
 DEFAULT_PICK_POST_BASE_MM = 30.0  # 잡은 후 Base Z축 상승
 
-V_J = 60
+V_J = 150
 A_J = 60
 
 V_L = 200.0
@@ -412,10 +412,12 @@ class RackTransportAction(Node):
         y_offset = 0.0
         if dest == "A-2":
             y_offset = 23.0
-        elif dest in ["A-3", "B-1"]:
-            y_offset = 20.0
+        elif dest in "A-3":
+            y_offset = 19.0
+        elif dest == "B-1":
+            y_offset = 14.0
         elif dest == "B-2":
-            y_offset = 10.0
+            y_offset = 12.0     # fix
         
         # 오프셋이 적용된 최종 타겟 좌표 계산
         final_target = _apply_offset(self.dr, st_dst["target"], dy=y_offset)
@@ -443,130 +445,115 @@ class RackTransportAction(Node):
    # INBOUND : WORKBENCH -> RACK
    # ==========================================================
     def _do_inbound(self, dest: str) -> Tuple[bool, str]:
-       valid = self._valid_keys()
-       if dest not in valid:
-           return False, f"Invalid rack key: {dest}"
-      
-       # [1] 목적지 스테이션 및 오프셋 설정
-       rack_place = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
-       st_dst = rack_place[dest]
+        valid = self._valid_keys()
+        if dest not in valid:
+            return False, f"Invalid rack key: {dest}"
+        
+        # [1] 목적지 스테이션 및 오프셋 설정
+        rack_place = self.build_rack_stations(self.dr, approach_dy=MOVE_PICK_APP_DY)
+        st_dst = rack_place[dest]
 
+        y_offset = 0.0
+        if dest == "A-2":
+            y_offset = 15.0
+        elif dest in "A-3":
+            y_offset = 13.0
+        elif dest in "B-1":
+            y_offset = 9.0
+        elif dest == "B-2":
+            y_offset = 10.0
+        
+        self.get_logger().info(f"[IN] WB -> {dest} (Offset: {y_offset}mm)")
 
-       y_offset = 0.0
-       if dest == "A-2":
-           y_offset = 16.0
-       elif dest in ["A-3"]:
-           y_offset = 13.0
-       elif dest in ["B-1"]:
-           y_offset = 9.0
-       elif dest == "B-2":
-           y_offset = 10.0
-      
-       self.get_logger().info(f"[IN] WB -> {dest} (Offset: {y_offset}mm)")
+        wb = self.build_wb_dy(self.dr, approach_dy=IN_WB_APP_DY)
+        rack = self.build_rack_stations(self.dr, approach_dy=IN_RACK_APP_DY)
+        st = rack[dest]
 
+        self._home()
+        self.grip_init_open(self.dr, wait_sec=0.2)
 
-       wb = self.build_wb_dy(self.dr, approach_dy=IN_WB_APP_DY)
-       rack = self.build_rack_stations(self.dr, approach_dy=IN_RACK_APP_DY)
-       st = rack[dest]
+        # ---------------------------------------------------------
+        # WB Pick Sequence (기존 유지)
+        # ---------------------------------------------------------
+        self.rel_movel_base(self.dr, 0, -180.0, 0, 0, 0, 0, 50.0)
+        
+        cur_pos, _ = self.dr.get_current_posx(self.dr.DR_BASE)
+        x, y, z, rx, ry, rz = [float(v) for v in cur_pos]
+        back_mm = 150
+        target = self.dr.posx(x, y - back_mm, z, rx, ry, rz)
+        self.dr.movel(target, vel=V_L, acc=A_L)
+        
+        self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
 
+        self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
+        self.rel_movel_tool(self.dr, 0, 0, 8.0, 0, 0, 0, 20.0)
+        self.grip_init_open(self.dr, wait_sec=0.2)
 
-       self._home()
-       self.grip_init_open(self.dr, wait_sec=0.2)
+        self.dr.movel(wb["target"], vel=V_L, acc=A_L)
+        self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
 
+        # WB에서 들어올림 (High Z)
+        self.rel_movel_base(self.dr, 0, 0, IN_BASE_LIFT_Z, 0, 0, 0, 50.0)
 
-       # ---------------------------------------------------------
-       # WB Pick Sequence (기존 유지)
-       # ---------------------------------------------------------
-       self.rel_movel_base(self.dr, 0, -180.0, 0, 0, 0, 0, 50.0)
-      
-       cur_pos, _ = self.dr.get_current_posx(self.dr.DR_BASE)
-       x, y, z, rx, ry, rz = [float(v) for v in cur_pos]
-       back_mm = 150
-       target = self.dr.posx(x, y - back_mm, z, rx, ry, rz)
-       self.dr.movel(target, vel=V_L, acc=A_L)
-      
-       self.dr.movel(wb["approach"], vel=V_L, acc=A_L)
+        # ---------------------------------------------------------
+        # Rack Approach Sequence (X -> Z -> Y)
+        # ---------------------------------------------------------
+        # 1. 최종 타겟 및 상단 접근 위치 계산 (오프셋 반영)
+        final_target = _apply_offset(self.dr, st_dst["target"], dy=y_offset)
+        place_app = _apply_offset(self.dr, final_target, dz=MOVE_PLACE_APP_DZ)
+        
+        self.get_logger().info(f"[MOVE] Rack Approach: X(Align) -> Z(Lower) -> Y(Enter)")
 
+        # 2. 현재 위치 (WB 상단 High Z)
+        cur_pos_lifted = self.dr.get_current_posx()[0]
 
-       self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
-       self.rel_movel_tool(self.dr, 0, 0, 8.0, 0, 0, 0, 20.0)
-       self.grip_init_open(self.dr, wait_sec=0.2)
+        # 3. [Step 1] X축 정렬 (Align X)
+        # - 목표: 타겟 X
+        # - 유지: 현재 Y, 현재 Z (높은 상태)
+        waypoint_x = self.dr.posx(
+            place_app[0],       # Target X
+            cur_pos_lifted[1],  # Current Y
+            cur_pos_lifted[2],  # Current Z (High)
+            cur_pos_lifted[3], cur_pos_lifted[4], cur_pos_lifted[5]
+        )
+        self.get_logger().info("[INBOUND] Step 1: X Align")
+        self.dr.movel(waypoint_x, vel=V_L, acc=A_L)
 
+        # 4. [Step 2] Z축 하강 (Lower Z)
+        # - 목표: 타겟 Z (place_app 높이)
+        # - 유지: 타겟 X, 현재 Y (뒤쪽)
+        # ※ Y로 진입하기 전에 미리 내려갑니다.
+        waypoint_z = self.dr.posx(
+            place_app[0],       # Target X
+            cur_pos_lifted[1],  # Current Y (Still Back)
+            place_app[2],       # Target Z (Low)
+            cur_pos_lifted[3], cur_pos_lifted[4], cur_pos_lifted[5]
+        )
+        self.get_logger().info("[INBOUND] Step 2: Z Lower (Pre-Leveling)")
+        self.dr.movel(waypoint_z, vel=V_L, acc=A_L)
 
-       self.dr.movel(wb["target"], vel=V_L, acc=A_L)
-       self.grip_close(self.dr, wait_sec=GRIP_WAIT_SEC)
+        # 5. [Step 3] Y축 진입 (Enter Y)
+        # - 목표: 랙 앞 (Approach Y)
+        # - 낮은 자세로 앞으로 전진
+        self.get_logger().info("[INBOUND] Step 3: Y Enter (Approach)")
+        self.dr.movel(place_app, vel=V_L, acc=A_L)
 
+        # 6. [Step 4] 최종 안착 (Inbound)
+        self.get_logger().info("[INBOUND] Step 4: Final Inbound")
+        self.dr.movel(final_target, vel=V_L, acc=A_L)
 
-       # WB에서 들어올림 (High Z)
-       self.rel_movel_base(self.dr, 0, 0, IN_BASE_LIFT_Z, 0, 0, 0, 50.0)
+        # ---------------------------------------------------------
+        # Finish
+        # ---------------------------------------------------------
+        self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
 
+        # Retract (뒤로 빠지기)
+        ret = _apply_offset(self.dr, st["target"], dy=-150.0)
+        self.dr.movel(ret, vel=V_L_SLOW, acc=A_L_SLOW)
 
-       # ---------------------------------------------------------
-       # Rack Approach Sequence (X -> Z -> Y)
-       # ---------------------------------------------------------
-       # 1. 최종 타겟 및 상단 접근 위치 계산 (오프셋 반영)
-       final_target = _apply_offset(self.dr, st_dst["target"], dy=y_offset)
-       place_app = _apply_offset(self.dr, final_target, dz=MOVE_PLACE_APP_DZ)
-      
-       self.get_logger().info(f"[MOVE] Rack Approach: X(Align) -> Z(Lower) -> Y(Enter)")
+        self._home()
+        return True, "Inbound Done"
 
-
-       # 2. 현재 위치 (WB 상단 High Z)
-       cur_pos_lifted = self.dr.get_current_posx()[0]
-
-
-       # 3. [Step 1] X축 정렬 (Align X)
-       # - 목표: 타겟 X
-       # - 유지: 현재 Y, 현재 Z (높은 상태)
-       waypoint_x = self.dr.posx(
-           place_app[0],       # Target X
-           cur_pos_lifted[1],  # Current Y
-           cur_pos_lifted[2],  # Current Z (High)
-           cur_pos_lifted[3], cur_pos_lifted[4], cur_pos_lifted[5]
-       )
-       self.get_logger().info("[INBOUND] Step 1: X Align")
-       self.dr.movel(waypoint_x, vel=V_L, acc=A_L)
-
-
-       # 4. [Step 2] Z축 하강 (Lower Z)
-       # - 목표: 타겟 Z (place_app 높이)
-       # - 유지: 타겟 X, 현재 Y (뒤쪽)
-       # ※ Y로 진입하기 전에 미리 내려갑니다.
-       waypoint_z = self.dr.posx(
-           place_app[0],       # Target X
-           cur_pos_lifted[1],  # Current Y (Still Back)
-           place_app[2],       # Target Z (Low)
-           cur_pos_lifted[3], cur_pos_lifted[4], cur_pos_lifted[5]
-       )
-       self.get_logger().info("[INBOUND] Step 2: Z Lower (Pre-Leveling)")
-       self.dr.movel(waypoint_z, vel=V_L, acc=A_L)
-
-
-       # 5. [Step 3] Y축 진입 (Enter Y)
-       # - 목표: 랙 앞 (Approach Y)
-       # - 낮은 자세로 앞으로 전진
-       self.get_logger().info("[INBOUND] Step 3: Y Enter (Approach)")
-       self.dr.movel(place_app, vel=V_L, acc=A_L)
-
-
-       # 6. [Step 4] 최종 안착 (Inbound)
-       self.get_logger().info("[INBOUND] Step 4: Final Inbound")
-       self.dr.movel(final_target, vel=V_L, acc=A_L)
-
-
-       # ---------------------------------------------------------
-       # Finish
-       # ---------------------------------------------------------
-       self.grip_open(self.dr, wait_sec=GRIP_WAIT_SEC)
-
-
-       # Retract (뒤로 빠지기)
-       ret = _apply_offset(self.dr, st["target"], dy=-150.0)
-       self.dr.movel(ret, vel=V_L_SLOW, acc=A_L_SLOW)
-
-
-       self._home()
-       return True, "Inbound Done"
 
 
     # ==========================================================
@@ -653,13 +640,13 @@ class TubeTransportNode(Node):
         self._as = ActionServer(
             self,
             TubeTransport,
-            "tube_transport",
+            "/tube_transport",
             goal_callback=self._on_goal,
             cancel_callback=self._on_cancel,
             execute_callback=self._on_execute,
         )
 
-        self.get_logger().info("TubeTransportNode ready (ActionServer: /dsr01/tube_transport)")
+        self.get_logger().info("TubeTransportNode ready (ActionServer: /tube_transport)")
 
     # -------------------------
     # Robot init
@@ -755,6 +742,8 @@ class TubeTransportNode(Node):
         result.message = ""
 
         job_id = goal.job_id
+        job_u = str(job_id).upper().strip()
+        is_waste = any(k in job_u for k in ("WASTE", "DISPOSE"))
         pick_posx_6 = list(goal.pick_posx)
         place_posx_6 = list(goal.place_posx)
 
@@ -765,10 +754,10 @@ class TubeTransportNode(Node):
         from .rel_move import rel_movel_base
 
         # ---- 파라미터(요청대로) ----
-        PICK_DOWN_MM = 50.0
-        PICK_UP_MM = 132.0
+        PICK_DOWN_MM = 30.0
+        PICK_UP_MM = 140.0
 
-        PLACE_DOWN_MM = 72.0
+        PLACE_DOWN_MM = 80.0
         PLACE_OPEN_WAIT = 1.2
         PLACE_UP_MM = 90.0
 
@@ -833,29 +822,87 @@ class TubeTransportNode(Node):
                 return result
 
             _set_ref_base(dsr, self)
+            # === 4) PLACE / DISPOSE ===
+            if is_waste:
+                # WASTE(폐기): 회전 + OPEN + JReady 복귀
+                self._fb(goal_handle, "DISPOSE_SEQ", 0.85, "rotate(J5/J2) -> OPEN -> JReady")
+                if self._cancel_check(goal_handle, "DISPOSE_SEQ"):
+                    result.error_code = "CANCELED"
+                    result.message = "Canceled during dispose seq"
+                    goal_handle.abort()
+                    return result
 
-            # === 4) PLACE: down -> OPEN(wait) -> up ===
-            self._fb(goal_handle, "PLACE_SEQ", 0.85, "down -> OPEN(wait) -> up")
-            if self._cancel_check(goal_handle, "PLACE_SEQ"):
-                result.error_code = "CANCELED"
-                result.message = "Canceled during place seq"
-                goal_handle.abort()
-                return result
+                # J5 rotate
+                try:
+                    cur_j = [float(v) for v in dr.get_current_posj()]
+                    tgt = cur_j[:]
+                    tgt[4] += float(DISPOSE_J5_ROTATE_DEG)
+                    self.get_logger().info(f"[DISPOSE] movej J5 += {DISPOSE_J5_ROTATE_DEG}deg")
+                    retj = dr.movej(tgt, vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
+                    if not self._ret_ok(retj, "DISPOSE movej(J5)"):
+                        raise RuntimeError(f"DISPOSE movej(J5) rejected ret={retj}")
+                except Exception as e:
+                    self.get_logger().warn(f"[DISPOSE] J5 rotate skipped/failed: {repr(e)}")
 
-            self.get_logger().info(f"[PLACE] down {PLACE_DOWN_MM}mm")
-            rel_movel_base(dr, 0, 0, -PLACE_DOWN_MM, 0, 0, 0, vel=VELOCITY)
+                # J2 rotate
+                try:
+                    cur_j = [float(v) for v in dr.get_current_posj()]
+                    tgt = cur_j[:]
+                    tgt[1] += float(DISPOSE_J2_ROTATE_DEG)
+                    self.get_logger().info(f"[DISPOSE] movej J2 += {DISPOSE_J2_ROTATE_DEG}deg")
+                    retj = dr.movej(tgt, vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
+                    if not self._ret_ok(retj, "DISPOSE movej(J2)"):
+                        raise RuntimeError(f"DISPOSE movej(J2) rejected ret={retj}")
+                except Exception as e:
+                    self.get_logger().warn(f"[DISPOSE] J2 rotate skipped/failed: {repr(e)}")
 
-            self.get_logger().info(f"[GRIP] grip_open(wait={PLACE_OPEN_WAIT})")
-            grip_open(dr, wait_sec=PLACE_OPEN_WAIT)
+                # gripper open (drop)
+                self.get_logger().info(f"[DISPOSE] grip_open(wait={DISPOSE_OPEN_WAIT_SEC})")
+                grip_open(dr, wait_sec=float(DISPOSE_OPEN_WAIT_SEC))
+                try:
+                    dr.wait(0.2)
+                except Exception:
+                    pass
 
-            self.get_logger().info(f"[PLACE] up {PLACE_UP_MM}mm")
-            rel_movel_base(dr, 0, 0, +PLACE_UP_MM, 0, 0, 0, vel=VELOCITY)
-            from DSR_ROBOT2 import movej
-            movej([0, 0, 90, 0, 90, 0], vel=60, acc=60)
+                # (선택) close로 초기화
+                try:
+                    self.get_logger().info("[DISPOSE] grip_close()")
+                    grip_close(dr)
+                    dr.wait(0.2)
+                except Exception:
+                    pass
+
+                # JReady 복귀
+                try:
+                    self.get_logger().info("[DISPOSE] return HOME_J_DEG")
+                    dr.movej(list(HOME_J_DEG), vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
+                except Exception as e:
+                    self.get_logger().warn(f"[DISPOSE] movej HOME_J_DEG failed: {repr(e)}")
+
+            else:
+                # 일반 PLACE: down -> OPEN(wait) -> up
+                self._fb(goal_handle, "PLACE_SEQ", 0.85, "down -> OPEN(wait) -> up")
+                if self._cancel_check(goal_handle, "PLACE_SEQ"):
+                    result.error_code = "CANCELED"
+                    result.message = "Canceled during place seq"
+                    goal_handle.abort()
+                    return result
+
+                self.get_logger().info(f"[PLACE] down {PLACE_DOWN_MM}mm")
+                rel_movel_base(dr, 0, 0, -PLACE_DOWN_MM, 0, 0, 0, vel=VELOCITY)
+
+                self.get_logger().info(f"[GRIP] grip_open(wait={PLACE_OPEN_WAIT})")
+                grip_open(dr, wait_sec=PLACE_OPEN_WAIT)
+
+                self.get_logger().info(f"[PLACE] up {PLACE_UP_MM}mm")
+                rel_movel_base(dr, 0, 0, +PLACE_UP_MM, 0, 0, 0, vel=VELOCITY)
+                from DSR_ROBOT2 import movej
+                movej([0, 0, 90, 0, 90, 0], vel=60, acc=60)
+
             # DONE
             result.success = True
             result.error_code = "OK"
-            result.message = "Simple pick&place done"
+            result.message = "Dispose sequence done" if is_waste else "Simple pick&place done"
 
             self.get_logger().info(f"[EXEC] done job_id={job_id}")
             self._fb(goal_handle, "DONE", 1.0, result.message)
