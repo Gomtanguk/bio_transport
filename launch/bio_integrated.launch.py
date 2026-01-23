@@ -17,6 +17,9 @@ def generate_launch_description():
     mode_arg = DeclareLaunchArgument('mode', default_value='virtual')
     host_arg = DeclareLaunchArgument('host', default_value='127.0.0.1')
     
+    # mode_arg = DeclareLaunchArgument('mode', default_value='real')
+    # host_arg = DeclareLaunchArgument('host', default_value='192.168.1.100')
+
     # [중요] 아까 테스트 성공했던 파라미터를 여기서도 쓸 수 있게 추가
     dry_run_arg = DeclareLaunchArgument(
         'dry_run', 

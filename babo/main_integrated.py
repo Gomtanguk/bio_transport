@@ -1,8 +1,9 @@
-# main_integrated v2.200 2026-01-22
+# main_integrated v2.300 2026-01-23
 # [이번 버전에서 수정된 사항]
-# - (기능추가) TubeTransport Action(tube_main_control)을 수신해 로봇(/tube_transport)으로 중계 + 피드백(stage/progress/detail) 전달
-# - (기능변경) Rack(BioCommand)과 Tube(TubeTransport)를 동일 asyncio.Lock으로 직렬화(1대 로봇 보호)
-# - (유지) QoS는 코드 설정값(ACTION_QOS: RELIABLE/VOLATILE/KEEP_LAST depth=5) 그대로 사용
+# - (기능추가) TUBE 명령 모드 확장: IN/OUT/MOVE/WASTE 지원 + WASTE는 DISPOSE_POSX로 폐기
+# - (기능추가) TubeTransport(/tube_transport) 피드백(stage/progress/detail)을 UI(BioCommand.Feedback.status)로 중계
+# - (버그수정) tube_goal_callback 타입을 BioCommand.Goal로 정정(로그/타입 혼동 방지)
+# - (유지) Rack/Tube를 동일 asyncio.Lock으로 직렬화(1대 로봇 보호), ACTION_QOS 유지
 
 """[모듈] main_integrated
 
@@ -70,10 +71,29 @@ ACTION_QOS = QoSProfile(
 # =========================
 # TUBE 명령 파싱 (기존 유지)
 # =========================
+# =========================
+# TUBE 명령 파싱
+# =========================
 def parse_command(cmd: str):
-    # 좌표 기준(현재 코드에선 사용 안하지만 기존 유지)
-    ORIGIN_POINT = [367.32, 6.58, 422.710, 103.18, 179.97, 103.14]
+    """
+    UI -> main으로 들어오는 1줄 명령을 절대좌표(pick_posx/place_posx)로 변환한다.
 
+    입력 예)
+    - "TUBE,IN,NONE,A-2-1"
+    - "TUBE,OUT,A-2-1,NONE"
+    - "TUBE,MOVE,A-2-1,A-2-3"   # 같은 rack_id 내 이동만 지원(기본 정책)
+    - "TUBE,WASTE,A-2-1,NONE"   # 폐기(Disposal)
+
+    반환)
+    - (cmd_type, mode, pick_pose6, place_pose6)
+    """
+
+    # ----------------------------------------------------------
+    # [고정 포인트] (기존 값 유지)
+    # ----------------------------------------------------------
+    ORIGIN_POINT = [367.32, 6.58, 422.710, 103.18, 179.97, 103.14]  # (참고용)
+
+    # Rack OUT(튜브를 집는 기준 포즈)
     A_OUT_1 = [300.11, -24.86, 421.12, 120.22, -179.78, 120.22]
     A_OUT_2 = [300.98, 13.85, 420.48, 156.15, -179.77, 155.93]
     A_OUT_3 = [302.63, 51.61, 419.08, 9.89, 179.71, 9.69]
@@ -84,11 +104,13 @@ def parse_command(cmd: str):
     B_OUT_3 = [299.42, 40.17, 418.31, 18.42, 179.13, 18.74]
     B_OUT_4 = [300.03, 80.63, 417.88, 16.66, 179.08, 17.21]
 
+    # Out station(출고 적치 포인트) / In station(입고 픽업 포인트)
     OUT_1 = [627.11, -154.34, 414.82, 116.42, 180.0, 116.05]
     OUT_2 = [632.19, -116.61, 411.86, 169.15, 179.67, 168.46]
     OUT_3 = [634.42, -75.46, 411.88, 173.08, 179.62, 172.65]
     OUT_4 = [634.45, -39.53, 403.94, 165.87, -179.97, 165.84]
 
+    # Rack IN(튜브를 넣는 기준 포즈)
     A_IN_1 = [300, -24.86, 540, 120, 180, 120]
     A_IN_2 = [300, 13.85, 540, 156, 180, 156]
     A_IN_3 = [300, 51.61, 540, 10, 180, 10]
@@ -99,10 +121,14 @@ def parse_command(cmd: str):
     B_IN_3 = [300, 40.17, 540, 18, 180, 18]
     B_IN_4 = [300, 80.63, 540, 17, 180, 17]
 
+    # In station(입고 투입부) 절대 포즈
     IN_1 = [624.18, -154.70, 359.04, 2.33, 178.99, 2.90]
     IN_2 = [626.52, -116.78, 358.43, 5.68, 179.09, 6.08]
     IN_3 = [628.10, -81.45, 355.87, 12.00, 179.23, 12.20]
     IN_4 = [629.05, -42.82, 351.11, 18.24, 179.32, 18.48]
+
+    # 폐기 위치(절대): tube_pick_disposal_node의 DISPOSE_POSX를 기본값으로 사용
+    DISPOSE_POSX = [640.0, -160.0, 410.0, 11.8, 180.0, 105.0]
 
     RACK_OUT_POINTS = {
         "A": {1: A_OUT_1, 2: A_OUT_2, 3: A_OUT_3, 4: A_OUT_4},
@@ -112,57 +138,96 @@ def parse_command(cmd: str):
         "A": {1: A_IN_1, 2: A_IN_2, 3: A_IN_3, 4: A_IN_4},
         "B": {1: B_IN_1, 2: B_IN_2, 3: B_IN_3, 4: B_IN_4},
     }
-
     OUT_POINTS = {1: OUT_1, 2: OUT_2, 3: OUT_3, 4: OUT_4}
     IN_POINTS = {1: IN_1, 2: IN_2, 3: IN_3, 4: IN_4}
 
-    # 1) 콤마 분해 + 공백 제거
+    # ----------------------------------------------------------
+    # 파싱 유틸
+    # ----------------------------------------------------------
+    def _parse_loc(loc_str: str):
+        """
+        loc 예) "A-2-1"
+        return: (rack_letter, rack_no, slot_int)
+        """
+        if not loc_str or str(loc_str).upper() == "NONE":
+            raise ValueError("Location is NONE. Expected a rack location like A-2-1")
+
+        loc = str(loc_str).strip().replace("_", "-")
+        toks = [t for t in loc.split("-") if t]
+        if len(toks) != 3:
+            raise ValueError(f"Invalid location format: {loc_str} (expected like A-2-1)")
+
+        rack_letter = toks[0].upper()
+        rack_no = toks[1].strip()
+        try:
+            slot = int(toks[2])
+        except Exception:
+            raise ValueError(f"Invalid slot in location: {loc_str}")
+
+        if rack_letter not in ("A", "B"):
+            raise ValueError("Rack letter must be A or B")
+        if slot not in (1, 2, 3, 4):
+            raise ValueError("Slot must be 1~4")
+
+        return rack_letter, rack_no, slot
+
+    # ----------------------------------------------------------
+    # 본 파싱
+    # ----------------------------------------------------------
     parts = [p.strip() for p in str(cmd).split(",")]
     if len(parts) < 4:
         raise ValueError("Invalid command format (need at least 4 comma-separated fields)")
 
     cmd_type = parts[0].upper()
+    if cmd_type != "TUBE":
+        raise ValueError(f"parse_command only supports TUBE. got: {cmd_type}")
 
-    # 2) IN / OUT 파싱 (입고/출고 허용)
     mode_str = parts[1].upper()
     if mode_str in ("IN", "입고"):
         mode = "IN"
     elif mode_str in ("OUT", "출고"):
         mode = "OUT"
+    elif mode_str in ("MOVE", "이동"):
+        mode = "MOVE"
+    elif mode_str in ("WASTE", "DISPOSE", "폐기"):
+        mode = "WASTE"
     else:
-        raise ValueError(f"Unknown mode: {mode_str}")
+        raise ValueError(f"Unknown mode: {mode_str} (expected IN/OUT/MOVE/WASTE)")
 
-    # 3) 위치 문자열 결정 (요구사항 반영: mode별 고정)
-    if mode == "OUT":
-        loc_str = parts[2]
-    else:
-        loc_str = parts[3]
+    src_str = parts[2].strip()
+    dst_str = parts[3].strip()
 
-    if loc_str.upper() == "NONE":
-        raise ValueError(f"Location is NONE for mode={mode}. Expected a rack location like A-2-1")
-
-    loc_parts = [p.strip() for p in loc_str.split("-")]
-    if len(loc_parts) != 3:
-        raise ValueError(f"Invalid location format: {loc_str} (expected like A-2-1)")
-
-    # 4) 랙/슬롯 파싱
-    rack_letter = loc_parts[0].upper()
-    slot = int(loc_parts[2])
-
-    if rack_letter not in ("A", "B"):
-        raise ValueError("Rack must be A or B")
-    if slot not in (1, 2, 3, 4):
-        raise ValueError("Slot must be 1~4")
-
-    # 5) IN/OUT 소스/목적 결정
+    # 모드별 pick/place 생성
     if mode == "IN":
-        pick_pose = IN_POINTS[1]  # IN_1 고정
+        rack_letter, rack_no, slot = _parse_loc(dst_str)
+        pick_pose = IN_POINTS[1]  # IN_1 고정(기존 유지)
         place_pose = RACK_IN_POINTS[rack_letter][slot]
-    else:
-        pick_pose = RACK_OUT_POINTS[rack_letter][slot]
-        place_pose = OUT_POINTS[1]  # OUT_1 고정
+        return cmd_type, mode, pick_pose, place_pose
 
-    return cmd_type, pick_pose, place_pose
+    if mode == "OUT":
+        rack_letter, rack_no, slot = _parse_loc(src_str)
+        pick_pose = RACK_OUT_POINTS[rack_letter][slot]
+        place_pose = OUT_POINTS[1]  # OUT_1 고정(기존 유지)
+        return cmd_type, mode, pick_pose, place_pose
+
+    if mode == "WASTE":
+        rack_letter, rack_no, slot = _parse_loc(src_str)
+        pick_pose = RACK_OUT_POINTS[rack_letter][slot]
+        place_pose = DISPOSE_POSX
+        return cmd_type, mode, pick_pose, place_pose
+
+    # MOVE (기본 정책: 같은 rack_id 내 이동만 지원)
+    src_letter, src_no, src_slot = _parse_loc(src_str)
+    dst_letter, dst_no, dst_slot = _parse_loc(dst_str)
+
+    if (src_letter != dst_letter) or (str(src_no) != str(dst_no)):
+        raise ValueError(
+            f"MOVE는 같은 rack_id 내에서만 지원합니다. (src={src_str}, dst={dst_str})"
+        )
+
+    pick_pose = RACK_OUT_POINTS[src_letter][src_slot]
+    place_pose = RACK_IN_POINTS[dst_letter][dst_slot]
+    return cmd_type, mode, pick_pose, place_pose
 
 class MainIntegrated(Node):
     def __init__(self):
@@ -306,8 +371,8 @@ class MainIntegrated(Node):
 
 
     # ---------------- Tube ----------------
-    def tube_goal_callback(self, goal_request: TubeTransport.Goal):
-        self.get_logger().info(f"📩 [Tube] Goal: job_id={getattr(goal_request, 'job_id', '')}")
+    def tube_goal_callback(self, goal_request: BioCommand.Goal):
+        self.get_logger().info(f"📩 [Tube] Goal: {getattr(goal_request, 'command', '')}")
         return GoalResponse.ACCEPT
 
     def tube_cancel_callback(self, goal_handle):
@@ -358,7 +423,7 @@ class MainIntegrated(Node):
             if cmd_type == "TUBE":
                 # 1) TUBE 파싱
                 try:
-                    _, pick_pose, place_pose = parse_command(raw_cmd)
+                    _, mode, pick_pose, place_pose = parse_command(raw_cmd)
                 except Exception as e:
                     msg = f"명령 파싱 실패(TUBE): {e}"
                     self.get_logger().error(msg)
@@ -366,14 +431,16 @@ class MainIntegrated(Node):
                     return BioCommand.Result(success=False, message=msg)
 
                 try:
-                    goal_handle.publish_feedback(BioCommand.Feedback(status="실행 중: TUBE (RACK->TUBE->RACK)"))
+                    goal_handle.publish_feedback(BioCommand.Feedback(status=f"실행 중: TUBE({mode}) (RACK->TUBE->RACK)"))
                 except Exception:
                     pass
 
                 pull_cmd, return_cmd = self._make_rack_pull_return_cmd(raw_cmd)
 
-                # 2) 랙 빼기
-                ok_pull, pull_msg = await self.call_robot(pull_cmd)
+                # 2) 랙 빼기 (필요 시)
+                ok_pull, pull_msg = (True, "skip")
+                if pull_cmd:
+                    ok_pull, pull_msg = await self.call_robot(pull_cmd)
                 if not ok_pull:
                     msg = f"랙 빼기 실패: {pull_msg}"
                     self.get_logger().error(msg)
@@ -381,11 +448,13 @@ class MainIntegrated(Node):
                     return BioCommand.Result(success=False, message=msg)
 
                 # 3) 튜브 이송
-                ok_tube, err_code, tube_msg = await self.call_tube_transport(cmd_type, pick_pose, place_pose)
+                ok_tube, err_code, tube_msg = await self.call_tube_transport(mode, pick_pose, place_pose, ui_goal_handle=goal_handle)
                 if not ok_tube:
                     # 실패여도 랙 복귀는 시도하는 정책(안전)
                     self.get_logger().error(f"튜브 이송 실패: {tube_msg} (error_code={err_code})")
 
+                    ok_ret, ret_msg = (True, "skip")
+                if return_cmd:
                     ok_ret, ret_msg = await self.call_robot(return_cmd)
                     if not ok_ret:
                         msg = f"튜브 이송 실패({err_code}): {tube_msg} / 랙 복귀도 실패: {ret_msg}"
@@ -398,7 +467,9 @@ class MainIntegrated(Node):
                     return BioCommand.Result(success=False, message=msg)
 
                 # 4) 랙 원위치
-                ok_ret, ret_msg = await self.call_robot(return_cmd)
+                ok_ret, ret_msg = (True, "skip")
+                if return_cmd:
+                    ok_ret, ret_msg = await self.call_robot(return_cmd)
                 if not ok_ret:
                     msg = f"랙 원위치 실패: {ret_msg}"
                     self.get_logger().error(msg)
@@ -436,27 +507,62 @@ class MainIntegrated(Node):
         return BioCommand.Result(success=success, message=str(msg))
 
     
-    async def call_tube_transport(self, _id, pick_pose, place_pose):
+    def _make_tube_feedback_callback(self, ui_goal_handle):
+        """
+        하위 /tube_transport(TubeTransport) 피드백을 UI(BioCommand.Feedback.status)로 변환해 중계한다.
+        """
+        if ui_goal_handle is None:
+            return None
+
+        def _cb(feedback_msg):
+            try:
+                fb = getattr(feedback_msg, "feedback", feedback_msg)
+                stage = str(getattr(fb, "stage", ""))
+                progress = float(getattr(fb, "progress", 0.0))
+                detail = str(getattr(fb, "detail", ""))
+
+                # progress가 0~1이면 %로 환산
+                pct = progress * 100.0 if progress <= 1.0 else progress
+                pct = max(0.0, min(100.0, pct))
+
+                msg = f"🟡 [TubeFeedback] {stage} ({pct:.0f}%) {detail}".strip()
+                ui_goal_handle.publish_feedback(BioCommand.Feedback(status=msg))
+            except Exception:
+                # 피드백 중계 실패는 작업 자체 실패로 보지 않음
+                pass
+
+        return _cb
+
+    async def call_tube_transport(self, mode: str, pick_pose, place_pose, ui_goal_handle=None):
+        """
+        main -> robot(/tube_transport) Action 호출.
+        mode: IN/OUT/MOVE/WASTE
+        """
         if not self.tube_client.wait_for_server(timeout_sec=2.0):
             return False, "NO_SERVER", "하위 튜브 Action(/tube_transport) 서버 연결 실패"
 
         goal = TubeTransport.Goal()
 
-        # job_id는 '필드가 있으면' 채움 (기존 의도 유지)
+        # job_id는 '필드가 있으면' 채움
+        mode_u = str(mode).upper().strip()
         if hasattr(goal, "job_id"):
-            goal.job_id = "tube_in_or_out"
+            goal.job_id = f"TUBE_{mode_u}"
 
-        # 인터페이스 필드명은 TubeTransport.action 기준(pick_posx/place_posx) 가정
         goal.pick_posx = [float(x) for x in pick_pose]
         goal.place_posx = [float(x) for x in place_pose]
 
-        gh = await self.tube_client.send_goal_async(goal)
+        fb_cb = self._make_tube_feedback_callback(ui_goal_handle)
+
+        gh = await self.tube_client.send_goal_async(goal, feedback_callback=fb_cb)
         if not gh.accepted:
             return False, "GOAL_REJECTED", "하위 튜브 Action Goal 거절됨"
 
         result = await gh.get_result_async()
-        return bool(result.result.success), str(getattr(result.result, "error_code", "")), str(getattr(result.result, "message", ""))
-
+        return (
+            bool(getattr(result.result, "success", False)),
+            str(getattr(result.result, "error_code", "")),
+            str(getattr(result.result, "message", "")),
+        )
 
 def main():
     rclpy.init()

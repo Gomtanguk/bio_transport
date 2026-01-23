@@ -1,9 +1,10 @@
-# ui_integrated v2.300 2026-01-23
+# ui_integrated v2.420 2026-01-23
 # [이번 버전에서 수정된 사항]
-# - (기능변경) 튜브(UI->Main)는 문자열 1줄(BioCommand.command)로만 전송: "TUBE,IN,NONE,A-2-1"
-# - (기능변경) UI에서 pick_posx/place_posx 계산 제거(좌표 계산은 main_integrated에서 수행)
-# - (버그수정) tube_client 콜백/Result 처리를 BioCommand 타입에 맞게 정리(큐 실행/재고 반영 정상화)
-# - (버그수정) set_busy_state()가 내부 상태를 재초기화하던 문제 제거(오버레이 show/hide만 수행)
+# - (변수수정) Busy 팝업의 '현재 작업' 표기를 [RACK][입고][B-1] 형태로 정리(리스트/따옴표 제거)
+# - (변수수정) 대상이 NONE/비어있으면 마지막 [대상] 구간은 표시하지 않도록 처리
+# - (유지) '작동 중' 팝업 메시지(라벨) 글자색 빨간색 유지
+# - (기능유지) 튜브(UI->Main)는 문자열 1줄(BioCommand.command)로만 전송: "TUBE,IN,NONE,A-2-1"
+# - (기능유지) UI에서 pick_posx/place_posx 계산 제거(좌표 계산은 main_integrated에서 수행)
 # - (유지) Rack은 기존 BioCommand(/bio_main_control) 흐름 유지, QoS 설정 유지
 
 """[모듈] ui_integrated
@@ -31,7 +32,7 @@ import subprocess
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QScrollArea, QGroupBox, QFrame, QGridLayout,
-    QLabel, QToolButton, QPushButton, QRadioButton, QLineEdit,
+    QLabel, QDialog, QToolButton, QPushButton, QRadioButton, QLineEdit,
     QFormLayout, QTextEdit, QSizePolicy, QButtonGroup
 )
 from PySide6.QtCore import Qt, QTimer
@@ -295,6 +296,35 @@ class UiActionClientNode(Node):
         self.ui.on_tube_action_result(ok, err, msg)
 
 
+
+class BusyPopup(QDialog):
+    """작업 실행 중, 추가 작업 시도를 막기 위한 간단 팝업."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("작동 중")
+        self.setModal(True)
+        self.setFixedSize(360, 180)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(12)
+
+        self.lbl = QLabel("작동 중입니다.", self)
+        self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #d32f2f;")
+        v.addWidget(self.lbl, stretch=1)
+
+        btn = QPushButton("닫기", self)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self.close)
+        v.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def set_message(self, text: str):
+        self.lbl.setText(str(text))
+
+
 class BioBankApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -341,6 +371,14 @@ class BioBankApp(QMainWindow):
         self.busy_overlay.setFixedSize(300, 150)
         self.busy_overlay.hide()
 
+
+        # -----------------------------
+        # 작업 실행 상태(전역 Busy)
+        # -----------------------------
+        self._rack_job_running = False
+        self._busy_reason = ""
+        self._busy_popup = BusyPopup(self)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         x = (self.width() - self.busy_overlay.width()) // 2
@@ -359,8 +397,84 @@ class BioBankApp(QMainWindow):
         else:
             self.busy_overlay.hide()
 
+        # NOTE:
+        # - Busy overlay는 시각적 표시만 담당
+        # - Busy 상태 플래그(_rack_job_running/_tube_job_running/_tube_job_queue)는
+        #   Result/Queue 처리 로직에서만 변경한다.
+
     def set_ros_node(self, ros_node):
         self.ros_node = ros_node
+
+
+    def _is_busy_global(self) -> bool:
+        return bool(self._rack_job_running or self._tube_job_running or self._tube_job_queue)
+
+    def _set_busy_reason(self, reason: str):
+        self._busy_reason = str(reason or "").strip()
+
+    # -----------------------------
+    # Busy reason formatter
+    # -----------------------------
+    @staticmethod
+    def _clean_target_token(tok: str) -> str:
+        """UI 표시용 토큰 정리(따옴표/대괄호/공백 제거, NONE는 빈값으로)."""
+        s = (tok or "").strip()
+        if not s:
+            return ""
+        if s.upper() == "NONE":
+            return ""
+        # 혹시 문자열로 넘어온 리스트 표현을 대비
+        s = s.strip().strip("[]").strip().strip("'\"")
+        return s
+
+    def _format_busy_reason_rack(self, mode_id: int, sel_list, dest_list) -> str:
+        """[RACK][입고][B-1] 형태로 Busy reason을 구성."""
+        mode_map = {1: "입고", 2: "출고", 3: "이동"}
+        mode_txt = mode_map.get(int(mode_id or 0), str(mode_id))
+
+        src = self._clean_target_token(sel_list[0]) if sel_list else ""
+        dst = self._clean_target_token(dest_list[0]) if dest_list else ""
+
+        target = ""
+        if int(mode_id or 0) == 1:
+            target = dst
+        elif int(mode_id or 0) == 2:
+            target = src
+        elif int(mode_id or 0) == 3:
+            if src and dst:
+                target = f"{src}->{dst}"
+            else:
+                target = src or dst
+
+        parts = ["RACK", mode_txt]
+        if target:
+            parts.append(target)
+
+        return "".join([f"[{p}]" for p in parts])
+
+    def show_busy_popup(self, extra: str = ""):
+        detail = self._busy_reason or "알 수 없음"
+        msg = "작동 중입니다.\n\n현재 작업: " + detail
+        if extra:
+            msg += "\n\n" + str(extra)
+        self._busy_popup.set_message(msg)
+        # 이미 떠 있으면 앞으로 가져오기
+        try:
+            self._busy_popup.show()
+            self._busy_popup.raise_()
+            self._busy_popup.activateWindow()
+        except Exception:
+            pass
+
+    def _auto_close_busy_popup_if_idle(self):
+        """Busy 팝업이 떠 있는 상태에서 시스템이 Idle로 돌아오면 자동으로 닫는다."""
+        if self._is_busy_global():
+            return
+        try:
+            if self._busy_popup.isVisible():
+                self._busy_popup.close()
+        except Exception:
+            pass
 
     def on_rack_action_result(self, success: bool, message: str):
         if success:
@@ -370,7 +484,17 @@ class BioBankApp(QMainWindow):
                 self.process_inventory_change(mode, sel_list, dest_list)
         else:
             self.log_t2(f"❌ [Result] 실패: {message}")
+
+        # Rack 작업 종료 처리 (Busy 해제)
+        self._rack_job_running = False
         self._pending_rack_change = None
+
+        # 다음 작업이 없으면 Busy reason 정리
+        if not self._tube_job_running and not self._tube_job_queue:
+            self._set_busy_reason("")
+
+        # Busy 팝업 자동 닫기(Idle 전환 시)
+        self._auto_close_busy_popup_if_idle()
 
     def on_tube_action_result(self, success: bool, error_code: str, message: str):
         if success:
@@ -383,7 +507,13 @@ class BioBankApp(QMainWindow):
 
         self._pending_tube_change = None
         self._tube_job_running = False
+        # 튜브 작업 종료 후, 다음 작업이 없고 rack도 안 돌면 busy reason 정리
+        if not self._rack_job_running and not self._tube_job_queue:
+            self._set_busy_reason("")
         self._start_next_tube_job()
+
+        # Busy 팝업 자동 닫기(Idle 전환 시)
+        self._auto_close_busy_popup_if_idle()
 
     def _start_next_tube_job(self):
         if self._tube_job_running:
@@ -395,6 +525,7 @@ class BioBankApp(QMainWindow):
         mode_id, sel_list, dest_list, line = self._tube_job_queue.pop(0)
         self._tube_job_running = True
         self._pending_tube_change = (mode_id, sel_list, dest_list)
+        self._set_busy_reason(f"TUBE: {line}")
 
         self.log_t1(f"📤 [Tube] 전송: {line}")
         if self.ros_node is None:
@@ -555,6 +686,10 @@ class BioBankApp(QMainWindow):
         self.update_text_fields_t2()
 
     def on_confirm_t1(self):
+        if self._is_busy_global():
+            self.show_busy_popup("현재 작업이 끝난 후 다시 시도하세요.")
+            return
+
         mode_id = self.t1_mode_group.checkedId()
         sel_list = list(self.t1_selected_items)
         dest_list = list(self.t1_dest_items)
@@ -619,6 +754,10 @@ class BioBankApp(QMainWindow):
         self._start_next_tube_job()
 
     def on_confirm_t2(self):
+        if self._is_busy_global():
+            self.show_busy_popup("현재 작업이 끝난 후 다시 시도하세요.")
+            return
+
         mode_id = self.t2_mode_group.checkedId()
         sel_list = list(self.t2_selected_items)
         dest_list = list(self.t2_dest_items)
@@ -655,6 +794,8 @@ class BioBankApp(QMainWindow):
         if not ok:
             return
 
+        self._rack_job_running = True
+        self._set_busy_reason(self._format_busy_reason_rack(mode_id, sel_list, dest_list))
         self._pending_rack_change = (mode_id, sel_list, dest_list)
 
     def create_rack_widget(self, storage_name, rack_idx, mode="tube"):
