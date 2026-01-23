@@ -568,6 +568,7 @@ class RackTransportAction(Node):
        self._home()
        return True, "Inbound Done"
 
+
     # ==========================================================
     # OUTBOUND : RACK -> WORKBENCH
     # ==========================================================
@@ -644,8 +645,6 @@ def _posx_from_list(dr, arr6):
 
 
 class TubeTransportNode(Node):
-
-
     def __init__(self):
         super().__init__("tube_transport_node", namespace=ROBOT_ID)
 
@@ -654,13 +653,13 @@ class TubeTransportNode(Node):
         self._as = ActionServer(
             self,
             TubeTransport,
-            "/tube_transport",
+            "tube_transport",
             goal_callback=self._on_goal,
             cancel_callback=self._on_cancel,
             execute_callback=self._on_execute,
         )
 
-        self.get_logger().info("TubeTransportNode ready (ActionServer: /tube_transport)")
+        self.get_logger().info("TubeTransportNode ready (ActionServer: /dsr01/tube_transport)")
 
     # -------------------------
     # Robot init
@@ -756,8 +755,6 @@ class TubeTransportNode(Node):
         result.message = ""
 
         job_id = goal.job_id
-        job_u = str(job_id).upper().strip()
-        is_waste = any(k in job_u for k in ("WASTE", "DISPOSE"))
         pick_posx_6 = list(goal.pick_posx)
         place_posx_6 = list(goal.place_posx)
 
@@ -768,10 +765,10 @@ class TubeTransportNode(Node):
         from .rel_move import rel_movel_base
 
         # ---- 파라미터(요청대로) ----
-        PICK_DOWN_MM = 30.0
-        PICK_UP_MM = 140.0
+        PICK_DOWN_MM = 50.0
+        PICK_UP_MM = 132.0
 
-        PLACE_DOWN_MM = 80.0
+        PLACE_DOWN_MM = 72.0
         PLACE_OPEN_WAIT = 1.2
         PLACE_UP_MM = 90.0
 
@@ -836,85 +833,29 @@ class TubeTransportNode(Node):
                 return result
 
             _set_ref_base(dsr, self)
-            # === 4) PLACE / DISPOSE ===
-            if is_waste:
-                # WASTE(폐기): 회전 + OPEN + JReady 복귀
-                self._fb(goal_handle, "DISPOSE_SEQ", 0.85, "rotate(J5/J2) -> OPEN -> JReady")
-                if self._cancel_check(goal_handle, "DISPOSE_SEQ"):
-                    result.error_code = "CANCELED"
-                    result.message = "Canceled during dispose seq"
-                    goal_handle.abort()
-                    return result
 
-                # J5 rotate
-                try:
-                    cur_j = [float(v) for v in dr.get_current_posj()]
-                    tgt = cur_j[:]
-                    tgt[4] += float(DISPOSE_J5_ROTATE_DEG)
-                    self.get_logger().info(f"[DISPOSE] movej J5 += {DISPOSE_J5_ROTATE_DEG}deg")
-                    retj = dr.movej(tgt, vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
-                    if not self._ret_ok(retj, "DISPOSE movej(J5)"):
-                        raise RuntimeError(f"DISPOSE movej(J5) rejected ret={retj}")
-                except Exception as e:
-                    self.get_logger().warn(f"[DISPOSE] J5 rotate skipped/failed: {repr(e)}")
+            # === 4) PLACE: down -> OPEN(wait) -> up ===
+            self._fb(goal_handle, "PLACE_SEQ", 0.85, "down -> OPEN(wait) -> up")
+            if self._cancel_check(goal_handle, "PLACE_SEQ"):
+                result.error_code = "CANCELED"
+                result.message = "Canceled during place seq"
+                goal_handle.abort()
+                return result
 
-                # J2 rotate
-                try:
-                    cur_j = [float(v) for v in dr.get_current_posj()]
-                    tgt = cur_j[:]
-                    tgt[1] += float(DISPOSE_J2_ROTATE_DEG)
-                    self.get_logger().info(f"[DISPOSE] movej J2 += {DISPOSE_J2_ROTATE_DEG}deg")
-                    retj = dr.movej(tgt, vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
-                    if not self._ret_ok(retj, "DISPOSE movej(J2)"):
-                        raise RuntimeError(f"DISPOSE movej(J2) rejected ret={retj}")
-                except Exception as e:
-                    self.get_logger().warn(f"[DISPOSE] J2 rotate skipped/failed: {repr(e)}")
+            self.get_logger().info(f"[PLACE] down {PLACE_DOWN_MM}mm")
+            rel_movel_base(dr, 0, 0, -PLACE_DOWN_MM, 0, 0, 0, vel=VELOCITY)
 
-                # gripper open (drop)
-                self.get_logger().info(f"[DISPOSE] grip_open(wait={DISPOSE_OPEN_WAIT_SEC})")
-                grip_open(dr, wait_sec=float(DISPOSE_OPEN_WAIT_SEC))
-                try:
-                    dr.wait(0.2)
-                except Exception:
-                    pass
+            self.get_logger().info(f"[GRIP] grip_open(wait={PLACE_OPEN_WAIT})")
+            grip_open(dr, wait_sec=PLACE_OPEN_WAIT)
 
-                # (선택) close로 초기화
-                try:
-                    self.get_logger().info("[DISPOSE] grip_close()")
-                    grip_close(dr)
-                    dr.wait(0.2)
-                except Exception:
-                    pass
-
-                # JReady 복귀
-                try:
-                    self.get_logger().info("[DISPOSE] return HOME_J_DEG")
-                    dr.movej(list(HOME_J_DEG), vel=float(VELOCITY_DISPOSE), acc=float(ACC_DISPOSE))
-                except Exception as e:
-                    self.get_logger().warn(f"[DISPOSE] movej HOME_J_DEG failed: {repr(e)}")
-
-            else:
-                # 일반 PLACE: down -> OPEN(wait) -> up
-                self._fb(goal_handle, "PLACE_SEQ", 0.85, "down -> OPEN(wait) -> up")
-                if self._cancel_check(goal_handle, "PLACE_SEQ"):
-                    result.error_code = "CANCELED"
-                    result.message = "Canceled during place seq"
-                    goal_handle.abort()
-                    return result
-
-                self.get_logger().info(f"[PLACE] down {PLACE_DOWN_MM}mm")
-                rel_movel_base(dr, 0, 0, -PLACE_DOWN_MM, 0, 0, 0, vel=VELOCITY)
-
-                self.get_logger().info(f"[GRIP] grip_open(wait={PLACE_OPEN_WAIT})")
-                grip_open(dr, wait_sec=PLACE_OPEN_WAIT)
-
-                self.get_logger().info(f"[PLACE] up {PLACE_UP_MM}mm")
-                rel_movel_base(dr, 0, 0, +PLACE_UP_MM, 0, 0, 0, vel=VELOCITY)
-
+            self.get_logger().info(f"[PLACE] up {PLACE_UP_MM}mm")
+            rel_movel_base(dr, 0, 0, +PLACE_UP_MM, 0, 0, 0, vel=VELOCITY)
+            from DSR_ROBOT2 import movej
+            movej([0, 0, 90, 0, 90, 0], vel=60, acc=60)
             # DONE
             result.success = True
             result.error_code = "OK"
-            result.message = "Dispose sequence done" if is_waste else "Simple pick&place done"
+            result.message = "Simple pick&place done"
 
             self.get_logger().info(f"[EXEC] done job_id={job_id}")
             self._fb(goal_handle, "DONE", 1.0, result.message)
